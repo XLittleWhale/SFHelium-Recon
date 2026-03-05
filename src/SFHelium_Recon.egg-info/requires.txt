@@ -1,0 +1,9 @@
+phiflow[jax]
+jax
+jaxlib
+numpy
+scipy
+matplotlib
+pyvista
+pandas
+optax

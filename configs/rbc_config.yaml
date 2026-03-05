@@ -1,0 +1,8 @@
+Nx: 64
+Ny: 64
+Lx: 0.1
+Ly: 0.1
+MARKERS: 128
+DT: 0.1
+STEPS: 10
+PRE_STEPS: 100
