@@ -1,8 +1,15 @@
 """
 Task 03: Cylinder flow simulation/inversion (uses SFHelium model)
 
+Optimization follows the proven D4.py approach:
+  - Direct CenteredGrid field as optimization variable
+  - L-BFGS-B via phiflow minimize()
+  - jax.lax.scan + jax.checkpoint for memory-efficient forward simulation
+  - Marker MSE loss + smoothness + energy regularization
+  - Obstacle (Sphere) constraint applied after each advection step
 """
 from phi.jax.flow import *
+from phi.jax.flow import Box, StaggeredGrid, CenteredGrid, ZERO_GRADIENT, instance, advect, math, batch, jit_compile, spatial, channel, dual, geom, PointCloud, minimize, Sphere, Obstacle, resample
 from sf_recon.physics import helium, boundaries
 from sf_recon.utils import viz, io
 from sf_recon.utils.load import load_csv_to_grids_cyl
@@ -15,36 +22,51 @@ from sf_recon.utils.saving import (
 import argparse
 import numpy as np
 import time
+import jax
+import jax.numpy as jnp
+
+
+def _pointcloud_list_to_numpy(pc_list):
+    """Convert a list of PointCloud objects to a (T, N, 2) numpy array."""
+    coords = []
+    for pc in pc_list:
+        if hasattr(pc, 'geometry'):
+            c = pc.geometry.center.numpy(['markers', 'vector'])
+        elif hasattr(pc, 'center'):
+            c = pc.center.numpy(['markers', 'vector'])
+        else:
+            c = np.asarray(pc)
+        coords.append(np.asarray(c))
+    return np.stack(coords, axis=0)
+
 
 def main():
-    # Choose initialization with external CSV if provided
-    # Choose whether to skip inversion
     parser = argparse.ArgumentParser()
     parser.add_argument('--init-csv', type=str, default=None, help='Optional OpenFOAM-export CSV to initialize fields')
     parser.add_argument('--skip-inversion', action='store_true', help='Skip the inversion step')
-    parser.add_argument('--nn-iters', type=int, default=500, help='Training iterations for U-Net optimization')
-    parser.add_argument('--nn-lr', type=float, default=5e-4, help='Learning rate for U-Net optimization')
-    parser.add_argument('--train-steps', type=int, default=None, help='Subsample time steps for faster training')
-    parser.add_argument('--train-markers', type=int, default=None, help='Subsample markers for faster training')
+    parser.add_argument('--lbfgs-iters', type=int, default=100, help='Max L-BFGS-B iterations')
     args = parser.parse_args()
 
     math.use('jax')
     math.set_global_precision(64)
 
     print('Task 03: starting')
-    # Domain and simulation parameters (tunable)
+    # ==========================================
+    # Domain and simulation parameters
+    # ==========================================
     Lx, Ly = 0.02, 0.2
     Nx, Ny = 40, 200
     RAD = 0.004
-    MARKERS = 512
-    DT = 1e-5
-    STEPS = 10
-    LOSS_SCALE = 1e6    # Changed from 1e12 to 1e9 so that initial physics loss is O(1) instead of O(1000)
-    VEL_SCALE = 0.2  # Smooth clamp for predicted velocity
-    REG_WEIGHT = 1  # Small weight decay to keep gradients active
-    SUP_WEIGHT = 1e3 # Small supervised weight for anchoring only 
-    PHYS_WEIGHT = 1e8  # Full physics backprop now that gradients are stabilized
-    U_REF = 0.02
+    MARKERS = 4096
+    DT = 1e-6
+    STEPS = 5
+    MSE_WEIGHT = 1e11
+    SMOOTH_WEIGHT = 0   # smoothness weight
+    ENERGY_WEIGHT  = 0   # energy weight
+    ZERO_WEIGHT    = 0  # anti-zero weight (prevent trivial all-zero solution)
+    DOMAIN = dict(x=Nx, y=Ny, bounds=Box(x=Lx, y=Ly))
+    SPHERE = Sphere(x=Lx/2, y=Ly/2, radius=RAD)
+    OBSTACLE = Obstacle(SPHERE)
 
     # Physical parameters
     HEAT_SOURCE_INTENSITY = 1.94
@@ -56,9 +78,6 @@ def main():
     Vn_IN = HEAT_FLUX / (DENSITY * ENTROPY * HEAT_SOURCE_INTENSITY)
     Vs_IN = -(DENSITY_N * Vn_IN) / DENSITY_S
     Vn_BC, Vs_BC, J_BC, t_BC_THERMAL, p_BC = boundaries.get_cylinder_bcs(Vn_IN=Vn_IN, Vs_IN=Vs_IN, PRESSURE_0=3130)
-    DOMAIN = dict(x=Nx, y=Ny, bounds=Box(x=Lx, y=Ly))
-    SPHERE = Sphere(x=Lx/2, y=Ly/2, radius=RAD)
-    OBSTACLE = Obstacle(SPHERE)
 
     # initialize GT fields
     def _init_fields_from_csv_or_default(init_csv=None):
@@ -105,202 +124,254 @@ def main():
     markers0 = DOMAIN['bounds'].sample_uniform(instance(markers=MARKERS))
     if OBSTACLE is not None:
         markers0 = helium.constrain_markers_push(markers0, OBSTACLE)
+    # Wrap as PointCloud for advect.points compatibility
+    initial_markers = PointCloud(geom.Point(markers0))
 
-    # Simulate GT
+    # ==========================================
+    # Simulate GT marker trajectories
+    # ==========================================
     curr_vn = v0_gt0
     curr_vs = vs0_gt0
     curr_p = p0_gt0
     curr_t = t0_gt0
     curr_L = L0_gt0
-    gt_traj = [markers0]
+    gt_traj = [initial_markers]
+    current_markers = initial_markers
     for _ in range(STEPS):
-        curr_vn, curr_vs, curr_p, curr_t, curr_L = helium.SFHelium_step(curr_vn, curr_vs, curr_p, curr_t, curr_L, dt=DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE, Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL)
-        markers0 = advect.points(markers0, curr_vn, dt=DT, integrator=advect.rk4)
-        try:
-            if OBSTACLE is not None:
-                markers0 = helium.constrain_markers_push(markers0, OBSTACLE)
-        except Exception:
-            pass
-        gt_traj.append(markers0)
+        curr_vn, curr_vs, curr_p, curr_t, curr_L = helium.SFHelium_step(
+            curr_vn, curr_vs, curr_p, curr_t, curr_L,
+            dt=DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE,
+            Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL
+        )
+        current_markers = advect.points(current_markers, curr_vn, dt=DT, integrator=advect.rk4)
+        if OBSTACLE is not None:
+            constrained_coords = helium.constrain_markers_push(current_markers.geometry.center, OBSTACLE)
+            current_markers = PointCloud(geom.Point(constrained_coords))
+        gt_traj.append(current_markers)
 
     gt_stack = math.stack(gt_traj, batch('time'))
-    gt_disp = []
-    for idx in range(len(gt_traj) - 1):
-        delta = gt_traj[idx + 1] - gt_traj[idx]
-        delta = math.where(math.is_finite(delta), delta, 0.0)
-        gt_disp.append(delta / DT)
-    gt_disp_stack = math.stack(gt_disp, batch('time_disp')) if gt_disp else None
     print('GT Generation Done.')
 
-    def _subsample_markers(markers_tensor):
-        if args.train_markers is None or args.train_markers >= MARKERS:
-            return markers_tensor
-        stride = max(1, MARKERS // args.train_markers)
-        try:
-            return markers_tensor.markers[::stride]
-        except Exception:
-            return markers_tensor
+    # Build GT trajectory as native array for scan-based loss
+    # Shape: (STEPS+1, MARKERS, 2)
+    gt_native_list = []
+    for step_pc in gt_traj:
+        if hasattr(step_pc, 'geometry'):
+            gt_native_list.append(step_pc.geometry.center.native(['markers', 'vector']))
+        else:
+            gt_native_list.append(step_pc.native(['markers', 'vector']))
+    gt_all_native = jnp.stack(gt_native_list, axis=0)  # (STEPS+1, MARKERS, 2)
 
-    train_steps = STEPS if args.train_steps is None else max(1, min(STEPS, args.train_steps))
-    train_gt_traj = [_subsample_markers(step) for step in gt_traj[:train_steps + 1]]
-    train_gt_stack = math.stack(train_gt_traj, batch('time'))
+    # Obstacle geometry constants for use inside scan loop
+    obstacle_center_np = np.array([float(SPHERE.center.vector[0]), float(SPHERE.center.vector[1])])
+    obstacle_radius = float(SPHERE.radius)
 
-    # Inversion: run optimization unless user requested skip
     v0_reconstructed = None
-    def _sanitize_staggered(v_field):
-        try:
-            vals = v_field.values
-            vals = math.where(math.is_finite(vals), vals, 0.0)
-            return StaggeredGrid(values=vals, extrapolation=v_field.extrapolation, bounds=v_field.bounds)
-        except Exception:
-            return v_field
-    def _sanitize_centered(c_field):
-        try:
-            vals = c_field.values
-            vals = math.where(math.is_finite(vals), vals, 0.0)
-            return CenteredGrid(values=vals, extrapolation=c_field.extrapolation, bounds=c_field.bounds)
-        except Exception:
-            return c_field
+
+    # ==========================================
+    # Inversion: L-BFGS-B direct field optimization (D4.py approach)
+    # ==========================================
     if not getattr(args, 'skip_inversion', False):
-        def _loss_function_raw(v_guess_centered):
-            vn = v_guess_centered.at(v0_gt0)
-            markers = train_gt_traj[0]
-            traj = [markers]
-            v_curr = vn
-            vs_curr = vs0_gt0
-            p_curr = p0_gt0
-            t_curr = t0_gt0
-            L_curr = L0_gt0
 
-            if OBSTACLE is not None:
-                obstacle_mask_vn = resample(~(OBSTACLE.geometry), v_curr)
-                v_curr = field.safe_mul(obstacle_mask_vn, v_curr)
-                obstacle_mask_vs = resample(~(OBSTACLE.geometry), vs_curr)
-                vs_curr = field.safe_mul(obstacle_mask_vs, vs_curr)
-                obstacle_mask_t = resample(~(OBSTACLE.geometry), t_curr)
-                t_curr = field.safe_mul(obstacle_mask_t, t_curr)
-                obstacle_mask_L = resample(~(OBSTACLE.geometry), L_curr)
-                L_curr = field.safe_mul(obstacle_mask_L, L_curr)
-                markers = helium.constrain_markers_push(markers, OBSTACLE)
+        # ------------------------------------------------------------------
+        # A. Define physical_step_logic for jax.lax.scan + jax.checkpoint
+        # ------------------------------------------------------------------
+        def physical_step_logic(carry_state_native, time_input_native):
+            """Single time-step for jax.lax.scan (native JAX arrays)."""
+            # 1. Unpack carry state
+            (v_x_nat, v_y_nat), (vs_x_nat, vs_y_nat), p_nat, t_nat, L_nat, coords_nat = carry_state_native
 
-            for _ in range(train_steps):
-                v_curr, vs_curr, p_curr, t_curr, L_curr = helium.SFHelium_step(
-                    v_curr, vs_curr, p_curr, t_curr, L_curr,
-                    dt=DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE,
-                    Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL
-                )
-                markers = advect.points(markers, v_curr, dt=DT, integrator=advect.rk4)
-                if OBSTACLE is not None:
-                    markers = helium.constrain_markers_push(markers, OBSTACLE)
-                traj.append(markers)
+            # 2. Reconstruct PhiFlow Grid objects
+            bounds = DOMAIN['bounds']
+            grid_shape = spatial(x=Nx, y=Ny)
 
-            sim = math.stack(traj, batch('time'))
-            diff = sim - train_gt_stack
-            diff = math.where(math.is_finite(diff), diff, 0.0)
-            # Average over time/markers and rescale to keep loss near 1
-            loss = math.mean(diff ** 2, dim=diff.shape) * LOSS_SCALE
-            return math.where(math.is_finite(loss), loss, math.tensor(1e6))
+            v_x_tensor = math.tensor(v_x_nat, spatial('x,y'))
+            v_y_tensor = math.tensor(v_y_nat, spatial('x,y'))
+            v_values = math.stack([v_x_tensor, v_y_tensor], dual(vector='x,y'))
+            v = StaggeredGrid(values=v_values, extrapolation=Vn_BC, bounds=bounds, resolution=grid_shape)
 
-        loss_function = jit_compile(_loss_function_raw)
+            vs_x_tensor = math.tensor(vs_x_nat, spatial('x,y'))
+            vs_y_tensor = math.tensor(vs_y_nat, spatial('x,y'))
+            vs_values = math.stack([vs_x_tensor, vs_y_tensor], dual(vector='x,y'))
+            vs = StaggeredGrid(values=vs_values, extrapolation=Vs_BC, bounds=bounds, resolution=grid_shape)
 
+            p = CenteredGrid(values=math.tensor(p_nat, grid_shape), extrapolation=p_BC, bounds=bounds, resolution=grid_shape)
+            t = CenteredGrid(values=math.tensor(t_nat, grid_shape), extrapolation=t_BC_THERMAL, bounds=bounds, resolution=grid_shape)
+            L = CenteredGrid(values=math.tensor(L_nat, grid_shape), extrapolation=ZERO_GRADIENT, bounds=bounds, resolution=grid_shape)
+
+            coords = math.tensor(coords_nat, instance('markers') & channel(vector='x,y'))
+
+            # 3. Physics step (with obstacle)
+            v_next, vs_next, p_next, t_next, L_next = helium.SFHelium_step(
+                v, vs, p, t, L,
+                dt=DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE,
+                Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL
+            )
+
+            # 4. Advect markers
+            markers_obj = PointCloud(geom.Point(coords))
+            markers_obj = advect.points(markers_obj, v_next, dt=DT, integrator=advect.rk4)
+            advected_coords = markers_obj.geometry.center
+
+            # 5. Obstacle constraint on markers (push outside sphere)
+            # Pure JAX arithmetic for scan compatibility
+            obs_c = jnp.array(obstacle_center_np)
+            obs_r = obstacle_radius
+            coords_jax = advected_coords.native(['markers', 'vector'])
+            diff_obs = coords_jax - obs_c
+            dist_obs = jnp.sqrt(jnp.sum(diff_obs ** 2, axis=-1, keepdims=True))
+            epsilon = 1e-4
+            correction = obs_c + (diff_obs / (dist_obs + 1e-6)) * (obs_r + epsilon)
+            is_inside = dist_obs < obs_r
+            coords_jax = jnp.where(is_inside, correction, coords_jax)
+
+            # 6. Pack back to native arrays
+            new_carry_native = (
+                (v_next.vector['x'].values.native(['x', 'y']),
+                 v_next.vector['y'].values.native(['x', 'y'])),
+                (vs_next.vector['x'].values.native(['x', 'y']),
+                 vs_next.vector['y'].values.native(['x', 'y'])),
+                p_next.values.native(['x', 'y']),
+                t_next.values.native(['x', 'y']),
+                L_next.values.native(['x', 'y']),
+                coords_jax
+            )
+            output_native = coords_jax
+            return new_carry_native, output_native
+
+        # Apply gradient checkpointing
+        step_fn_checkpointed = jax.checkpoint(physical_step_logic)
+
+        # ------------------------------------------------------------------
+        # B. Loss function with L-BFGS-B compatible signature
+        # ------------------------------------------------------------------
+        @jit_compile
+        def loss_function(v_guess_centered):
+            """
+            Loss = marker MSE + smoothness + energy.
+            v_guess_centered: CenteredGrid (Nx, Ny, vector=2)
+            """
+            # A. Convert guess to StaggeredGrid & apply obstacle mask
+            v_sim = v_guess_centered.at(v0_gt0)
+            obstacle_mask_vn = resample(~(OBSTACLE.geometry), v_sim)
+            v_sim = field.safe_mul(obstacle_mask_vn, v_sim)
+
+            # B. Pack initial state as native arrays
+            v_init_tuple = (
+                v_sim.vector['x'].values.native(['x', 'y']),
+                v_sim.vector['y'].values.native(['x', 'y'])
+            )
+            vs_init_tuple = (
+                vs0_gt0.vector['x'].values.native(['x', 'y']),
+                vs0_gt0.vector['y'].values.native(['x', 'y'])
+            )
+
+            init_coords = initial_markers.geometry.center
+            state_init_native = (
+                v_init_tuple,
+                vs_init_tuple,
+                p0_gt0.values.native(['x', 'y']),
+                t0_gt0.values.native(['x', 'y']),
+                L0_gt0.values.native(['x', 'y']),
+                init_coords.native(['markers', 'vector'])
+            )
+
+            # C. Dummy scan inputs
+            scan_inputs = jnp.arange(STEPS)
+
+            # D. Run forward simulation via jax.lax.scan
+            final_state_native, trajectory_stack_native = jax.lax.scan(
+                step_fn_checkpointed, state_init_native, scan_inputs
+            )
+            # trajectory_stack_native: (STEPS, MARKERS, 2)
+
+            # E. Marker MSE loss
+            gt_target_native = gt_all_native[1:]  # (STEPS, MARKERS, 2)
+            diff = trajectory_stack_native - gt_target_native
+            mse_loss = jnp.sum(diff ** 2)
+
+            # F. Smoothness regularization
+            u_component = v_guess_centered.vector['x']
+            v_component = v_guess_centered.vector['y']
+            grad_u = field.spatial_gradient(u_component)
+            grad_v = field.spatial_gradient(v_component)
+            smoothness_loss = field.l2_loss(grad_u) + field.l2_loss(grad_v)
+
+            # G. Energy penalty
+            vn_vals = v_guess_centered.values.native(['x', 'y', 'vector'])
+            energy_loss = 0.5 * jnp.sum(vn_vals ** 2)
+
+            # H. Anti-zero penalty (prevent trivial all-zero solution)
+            mean_sq = jnp.mean(vn_vals ** 2)
+            anti_zero_loss = 1.0 / (mean_sq + 1e-12)
+
+            # I. Total loss with weights
+            total_loss = MSE_WEIGHT * mse_loss + SMOOTH_WEIGHT * smoothness_loss + ENERGY_WEIGHT * energy_loss + ZERO_WEIGHT * anti_zero_loss
+
+            return total_loss
+
+        # ------------------------------------------------------------------
+        # C. Initialize guess & run L-BFGS-B optimization
+        # ------------------------------------------------------------------
+        print('\nInitializing optimization guess...')
+        
+        # Start from zero/zero+noise/base/base+noise as initial guess
+        zero_values = math.zeros(spatial(x=Nx, y=Ny) & channel(vector='x,y'))
+        base_values = v0_gt0.at_centers().values
+        
         guess_shape = v0_gt0.at_centers().values.shape
         noise_scale = 0.005
         noise = math.random_uniform(guess_shape, low=-noise_scale, high=noise_scale)
-        base_guess = v0_gt0.at_centers().values
-        # Initialize from GT + noise so it's easy to tune
-        v_guess = CenteredGrid(values=base_guess + noise, extrapolation=Vn_BC, bounds=Box(x=Lx, y=Ly))
-
-        print('Starting U-Net training')
-
-        # U-Net training (2D) following PhiML Networks examples
-        from phiml import nn as phiml_nn
-        net = phiml_nn.u_net(in_channels=2, out_channels=2, in_spatial=2)
-
-        def _ensure_net_parameters(network):
-            if getattr(network, 'parameters', None) is not None:
-                return
-            init_fn = getattr(network, 'initialize', None)
-            if callable(init_fn):
-                try:
-                    init_fn()
-                except Exception:
-                    pass
-            if getattr(network, 'parameters', None) is None:
-                try:
-                    from phiml.backend.jax import stax_nets as _stax_nets
-                    rnd_key = _stax_nets.JAX.rnd_key
-                    _stax_nets.JAX.rnd_key, init_key = _stax_nets.random.split(rnd_key)
-                    _, params64 = network._initialize(init_key, input_shape=network._input_shape)
-                    network.parameters = params64
-                except Exception:
-                    pass
-
-        _ensure_net_parameters(net)
-        optimizer = phiml_nn.adam(net, learning_rate=args.nn_lr)
-        train_x = v_guess.values
-
-        try:
-            init_pred = math.native_call(net, train_x)
-            init_pred_centered = CenteredGrid(values=init_pred, extrapolation=Vn_BC, bounds=Box(x=Lx, y=Ly))
-            init_loss = _loss_function_raw(init_pred_centered)
-            print(f'Initial loss (net): {float(init_loss):.10g}')
-        except Exception:
-            pass
-
-        def unet_loss(x_tensor, dyn_sup_weight):
-            # Prediction: velocity field -> supervised match to initial guess
-            raw_pred = math.native_call(net, x_tensor)
-            raw_pred = math.where(math.is_finite(raw_pred), raw_pred, 0.0)
-            # Bound velocities without triggering JAX tracer conversion
-            # pred = math.clip(pred, -VEL_SCALE, VEL_SCALE)
-            pred = U_REF * raw_pred
-            pred_centered = CenteredGrid(values=pred, extrapolation=Vn_BC, bounds=Box(x=Lx, y=Ly))
-            physics = _loss_function_raw(pred_centered)
-            physics = math.where(math.is_finite(physics), physics, math.tensor(0.0))
-            reg = math.mean(raw_pred ** 2, dim=raw_pred.shape)
-            sup = math.mean((pred - x_tensor) ** 2, dim=pred.shape)
-            
-            # Using clean physics loss. Scale is handled globally by LOSS_SCALE now.
-            return dyn_sup_weight * sup + REG_WEIGHT * reg + PHYS_WEIGHT * physics
-
-        unet_loss = jit_compile(unet_loss)
         
-        current_sup_weight = SUP_WEIGHT
+        init_values = zero_values + noise
+        # init_values = base_values + noise
         
-        for it in range(args.nn_iters):
-            if it > 0 and it % 100 == 0:
-                current_sup_weight *= 0.5
-                print(f'->Step {it}: Reducing SUP_WEIGHT to {current_sup_weight}')
-            
-            dyn_sup_weight = math.tensor(current_sup_weight)
-            
-            loss_value = phiml_nn.update_weights(net, optimizer, unet_loss, train_x, dyn_sup_weight)
-            if not math.all(math.is_finite(loss_value)).all:
-                print(f'U-Net iter {it + 1}/{args.nn_iters}: loss became non-finite, stopping early.')
-                break
-            if (it + 1) % 20 == 0:
-                try:
-                    raw_pred_dbg = math.native_call(net, train_x)
-                    # pred_dbg = math.clip(pred_dbg, -VEL_SCALE, VEL_SCALE)
-                    pred_dbg = raw_pred_dbg * U_REF
-                    physics_dbg = _loss_function_raw(CenteredGrid(values=pred_dbg, extrapolation=Vn_BC, bounds=Box(x=Lx, y=Ly)))
-                    sup_dbg = SUP_WEIGHT * math.mean((pred_dbg - train_x) ** 2, dim=pred_dbg.shape)
-                    print(
-                        f'U-Net iter {it + 1}/{args.nn_iters}: '
-                        f'loss={float(loss_value):.10g}, '
-                        f'sup={float(sup_dbg):.10g}, '
-                        f'physics={float(physics_dbg):.10g}'
-                    )
-                except Exception:
-                    print(f'U-Net iter {it + 1}/{args.nn_iters}: loss={float(loss_value):.10g}')
+        v_guess_proxy = CenteredGrid(
+            values=init_values,
+            extrapolation=Vn_BC,
+            bounds=DOMAIN['bounds']
+        )
 
-        pred_centered = _sanitize_centered(CenteredGrid(values=math.native_call(net, train_x) * U_REF, extrapolation=Vn_BC, bounds=Box(x=Lx, y=Ly)))
-        v0_reconstructed = _sanitize_staggered(pred_centered.at(v0_gt0))
+        # Evaluate initial loss
         try:
-            final_loss = _loss_function_raw(pred_centered)
-            print(f'Final loss: {float(final_loss):.10g}')
-        except Exception:
-            pass
+            init_loss = loss_function(v_guess_proxy)
+            print(f'Initial loss: {float(init_loss):.6e}')
+        except Exception as e:
+            print(f'Initial loss evaluation failed: {e}')
+
+        print(f'\nStarting Optimization (L-BFGS-B, max_iter={args.lbfgs_iters})...')
+        t_start = time.time()
+
+        optimizer = Solve(
+            'L-BFGS-B',
+            x0=v_guess_proxy,
+            max_iterations=args.lbfgs_iters,
+            # abs_tol = 1e-16,
+            suppress=[phi.math.Diverged, phi.math.NotConverged]
+        )
+
+        with math.SolveTape(record_trajectories=False) as solves:
+            result_centered = minimize(loss_function, optimizer)
+
+        t_end = time.time()
+        print(f'Optimization finished in {t_end - t_start:.2f} s')
+
+        # Extract result
+        v0_reconstructed = result_centered.at(v0_gt0)
+        # Apply obstacle mask
+        obstacle_mask_vn = resample(~(OBSTACLE.geometry), v0_reconstructed)
+        v0_reconstructed = field.safe_mul(obstacle_mask_vn, v0_reconstructed)
+
+        final_loss = loss_function(result_centered)
+
+        print(f'=== Optimization Result ===')
+        print(f'Final Loss: {float(final_loss):.6e}')
+
+        # Compare with GT
+        diff_field = v0_reconstructed - v0_gt0
+        diff_mag = field.l2_loss(diff_field)
+        print(f'Field Reconstruction Error (L2): {float(diff_mag):.6e}')
+
     else:
         v0_reconstructed = None
 
@@ -323,7 +394,7 @@ def main():
 
         # Reconstruct particle trajectories advected by reconstructed normal fluid
         try:
-            markers_rec = gt_traj[0]
+            markers_rec = initial_markers
             recon_traj_list = [markers_rec]
             v_curr = v0_reconstructed
             vs_curr = vs0_gt0
@@ -340,7 +411,6 @@ def main():
                 t_curr = field.safe_mul(obstacle_mask_t, t_curr)
                 obstacle_mask_L = resample(~(OBSTACLE.geometry), L_curr)
                 L_curr = field.safe_mul(obstacle_mask_L, L_curr)
-                markers_rec = helium.constrain_markers_push(markers_rec, OBSTACLE)
             
             for _ in range(STEPS):
                 v_curr, vs_curr, p_curr, t_curr, L_curr = helium.SFHelium_step(
@@ -350,10 +420,11 @@ def main():
                 )
                 markers_rec = advect.points(markers_rec, v_curr, dt=DT, integrator=advect.rk4)
                 if OBSTACLE is not None:
-                    markers_rec = helium.constrain_markers_push(markers_rec, OBSTACLE)
+                    constrained_coords = helium.constrain_markers_push(markers_rec.geometry.center, OBSTACLE)
+                    markers_rec = PointCloud(geom.Point(constrained_coords))
                 recon_traj_list.append(markers_rec)
             recon_stack = math.stack(recon_traj_list, batch('time'))
-            recon_traj = _simple_to_numpy(recon_stack)
+            recon_traj = _pointcloud_list_to_numpy(recon_traj_list)
         except Exception:
             recon_traj = None
 
@@ -400,7 +471,7 @@ def main():
     t_gt = _prepare_save(t_gt)
     t_recon = _prepare_save(t_recon)
 
-    gt_np = _simple_to_numpy(gt_stack)
+    gt_np = _pointcloud_list_to_numpy(gt_traj)
     save_dict = dict(
         success=1, gt=gt_np, recon=recon_traj,
         v_gt_speed=v_gt_speed, v_recon_speed=v_recon_speed, v_gt_vec=v_gt_vec, v_recon_vec=v_recon_vec,
