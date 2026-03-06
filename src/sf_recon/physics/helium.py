@@ -98,10 +98,16 @@ def SFHelium_step(vn, vs, p, t, L, dt, DOMAIN=None, OBSTACLE=None, Vn_BC=None, V
     
     # 2. BCs adjustment 
     y_coords = t.points.vector['y']
+    
+    ## for task02
     Ly = 0.0016
     Ny = 80
+    SUB_STEPS = 5
+    
+    ## for task03
     # Ly = 0.5
     # Ny = 200
+    # SUB_STEPS = 20
 
     sponge_top = Ly - Ly/Ny
     steepness = 20000.0
@@ -146,7 +152,7 @@ def SFHelium_step(vn, vs, p, t, L, dt, DOMAIN=None, OBSTACLE=None, Vn_BC=None, V
     # ==============================================================================
     # 6. Mutual friction and Vinen equation (Sub-cycling)
     # ==============================================================================
-    sub_steps = 20 
+    sub_steps = SUB_STEPS
     dt_sub = dt / sub_steps
     
     rho_ratio_s = (RHO_S / RHO)
