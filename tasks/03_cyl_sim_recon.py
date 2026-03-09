@@ -56,7 +56,7 @@ def main():
     # ==========================================
     Lx, Ly = 0.02, 0.2
     Nx, Ny = 40, 200
-    RAD = 0.004
+    RAD = 0.004  #0.003175  #0.004
     MARKERS = 4096
     DT = 1e-6
     STEPS = 5
@@ -70,7 +70,7 @@ def main():
 
     # Physical parameters
     HEAT_SOURCE_INTENSITY = 1.94
-    HEAT_FLUX = 6000
+    HEAT_FLUX = 6000  #10000  #3000  #6000
     DENSITY = 145.5244
     ENTROPY = 813.4
     DENSITY_N = 68.22
