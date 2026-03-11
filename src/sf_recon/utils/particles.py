@@ -2,11 +2,85 @@ from phi.jax.flow import *
 import numpy as np
 import pandas as pd
 
-@jit_compile
+
+def pointcloud_list_to_numpy(pointcloud_list):
+    """Convert a list of marker clouds to a stable ``(T, N, 2)`` NumPy array."""
+    coords = []
+    for pointcloud in pointcloud_list:
+        if hasattr(pointcloud, 'geometry'):
+            center = pointcloud.geometry.center.numpy(['markers', 'vector'])
+        elif hasattr(pointcloud, 'center'):
+            center = pointcloud.center.numpy(['markers', 'vector'])
+        else:
+            center = np.asarray(pointcloud)
+        coords.append(np.asarray(center, dtype=float))
+    return np.stack(coords, axis=0)
+
+
+def tensor_time_markers_to_numpy(tensor_obj):
+    """Convert a time / marker tensor to a stable ``(T, N, 2)`` NumPy array."""
+    if tensor_obj is None:
+        return None
+    try:
+        return np.asarray(tensor_obj.native(['time', 'markers', 'vector']), dtype=float)
+    except Exception:
+        try:
+            return np.asarray(tensor_obj.numpy(['time', 'markers', 'vector']), dtype=float)
+        except Exception:
+            try:
+                return np.asarray(tensor_obj, dtype=float)
+            except Exception:
+                return None
+
+
+def tensor_time_marker_mask_to_numpy(tensor_obj):
+    """Convert a time / marker mask tensor to a stable ``(T, N)`` NumPy array."""
+    if tensor_obj is None:
+        return None
+    try:
+        return np.asarray(tensor_obj.native(['time', 'markers']), dtype=float)
+    except Exception:
+        try:
+            return np.asarray(tensor_obj.numpy(['time', 'markers']), dtype=float)
+        except Exception:
+            try:
+                return np.asarray(tensor_obj, dtype=float)
+            except Exception:
+                return None
+
+
+def marker_window_bounds(markers_np, mask_np=None):
+    """Return effective marker bounds as ``(x_min, x_max, y_min, y_max)``."""
+    if markers_np is None:
+        return None
+    points = np.asarray(markers_np, dtype=float)
+    if points.ndim != 3 or points.shape[-1] != 2:
+        return None
+    valid = np.isfinite(points[..., 0]) & np.isfinite(points[..., 1])
+    if mask_np is not None:
+        try:
+            mask_arr = np.asarray(mask_np, dtype=float)
+            if mask_arr.shape == points.shape[:2]:
+                valid &= mask_arr > 0.5
+        except Exception:
+            pass
+    if not np.any(valid):
+        return None
+    x_vals = points[..., 0][valid]
+    y_vals = points[..., 1][valid]
+    return float(np.min(x_vals)), float(np.max(x_vals)), float(np.min(y_vals)), float(np.max(y_vals))
+
 def load_particle_trajectories(file_path, num_particles, max_steps, dt, domain_bounds, freq=120):
+    """Load experimental particle trajectories from Excel.
+
+    This function intentionally stays outside JIT because it uses pandas and
+    NumPy interpolation on host arrays.
+    """
     df = pd.read_excel(file_path)
     df = df[df['category'] == 'g2']
-    offset_y = domain_bounds.upper.vector[1]/2 - (domain_bounds.upper.vector[1]-domain_bounds.lower.vector[1])/2
+    upper_y = float(domain_bounds.upper.vector[1])
+    lower_y = float(domain_bounds.lower.vector[1])
+    offset_y = upper_y / 2.0 - (upper_y - lower_y) / 2.0
     df['time_phys'] = df['time'] * (1/freq)
     df['pos_x_phys'] = df['pos_x'] * 1.265e-5
     df['pos_y_phys'] = df['pos_y'] * 1.265e-5 + offset_y

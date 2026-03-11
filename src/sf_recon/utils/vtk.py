@@ -49,6 +49,7 @@ def load_and_align_fields(vtk_path, domain_res, domain_bounds, boundary_conditio
     """
     source_mesh = pv.read(vtk_path)
     sampled_mesh, (nx, ny), sign_flat = resample_axisymmetric_rotated_ij(source_mesh, domain_res, domain_bounds, translation)
+    grid_res = spatial(x=nx, y=ny)
 
     def get_tensor_data(name, is_vector=False):
         if name not in sampled_mesh.point_data:
@@ -79,11 +80,11 @@ def load_and_align_fields(vtk_path, domain_res, domain_bounds, boundary_conditio
     p_grid = CenteredGrid(tensor(p_np, spatial('x,y')), boundary_conditions['p'], bounds=domain_bounds)
 
     un_grid_centered = CenteredGrid(tensor(un_np, spatial('x,y'), channel(vector='x,y')), boundary_conditions['v'], bounds=domain_bounds)
-    target_v_template = StaggeredGrid(0, boundary_conditions['v'], bounds=domain_bounds, resolution=domain_res)
+    target_v_template = StaggeredGrid(0, boundary_conditions['v'], bounds=domain_bounds, resolution=grid_res)
     v_staggered = un_grid_centered.at(target_v_template)
 
     us_grid_centered = CenteredGrid(tensor(us_np, spatial('x,y'), channel(vector='x,y')), boundary_conditions['vs'], bounds=domain_bounds)
-    target_vs_template = StaggeredGrid(0, boundary_conditions['vs'], bounds=domain_bounds, resolution=domain_res)
+    target_vs_template = StaggeredGrid(0, boundary_conditions['vs'], bounds=domain_bounds, resolution=grid_res)
     vs_staggered = us_grid_centered.at(target_vs_template)
 
     return v_staggered, vs_staggered, t_grid, l_grid, p_grid

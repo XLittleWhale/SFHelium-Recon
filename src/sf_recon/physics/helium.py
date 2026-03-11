@@ -28,7 +28,7 @@ C3_COEFFS = [-4.18764389500096, 8.88295312215358, -5.42845535938227, 1.493516223
 B = 1.008
 KAPPA = 9.97e-8
 
-COLD_SOURCE_INTENSITY = 1.94
+COLD_SOURCE_INTENSITY = 1.85  #1.94
 
 # Pressure solver default (forward + gradient solve)
 PRESSURE_SOLVER = Solve(
@@ -100,14 +100,19 @@ def SFHelium_step(vn, vs, p, t, L, dt, DOMAIN=None, OBSTACLE=None, Vn_BC=None, V
     y_coords = t.points.vector['y']
     
     ## for task02
-    Ly = 0.0016
-    Ny = 80
-    SUB_STEPS = 5
+    # Ly = 0.0016
+    # Ny = 80
+    # SUB_STEPS = 5
     
     ## for task03
     # Ly = 0.5
     # Ny = 200
     # SUB_STEPS = 20
+    
+    ## for task04
+    Ly = 0.320
+    Ny = 320
+    SUB_STEPS = 20
 
     sponge_top = Ly - Ly/Ny
     steepness = 20000.0
@@ -234,6 +239,7 @@ def SFHelium_step(vn, vs, p, t, L, dt, DOMAIN=None, OBSTACLE=None, Vn_BC=None, V
     vns_final = vn_centered_final - vs_centered_final
     
     L_final = L.at(t)
+    # L_final = (alpha_v/beta_v)**2 * (field.vec_squared(vns_final).at(t))
     B_coeff_final = (B / 3.0 * KAPPA) * L_final
     Fns_coeff_final = B_coeff_final * (RHO_S/RHO) 
     

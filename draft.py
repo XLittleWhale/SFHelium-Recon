@@ -1,0 +1,1018 @@
+"""
+Task 03: Cylinder flow simulation/inversion (uses SFHelium model)
+
+"""
+from phi.jax.flow import *
+from sf_recon.physics import helium, boundaries
+from sf_recon.utils import viz, io
+from sf_recon.utils.load import load_csv_to_grids_cyl
+from sf_recon.utils.saving import (
+    simple_to_numpy as _simple_to_numpy,
+    stack_if_possible as _stack_if_possible,
+    extract_time_series_for_vn as _extract_time_series_for_vn,
+    ensure_HW as _ensure_HW,
+)
+import argparse
+import numpy as np
+import time
+
+def main():
+    # Choose initialization with external CSV if provided
+    # Choose whether to skip inversion
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--init-csv', type=str, default=None, help='Optional OpenFOAM-export CSV to initialize fields')
+    parser.add_argument('--skip-inversion', action='store_true', help='Skip the inversion step')
+    args = parser.parse_args()
+
+    math.set_global_precision(64)
+
+    print('Task 03: starting')
+    # Domain and simulation parameters (tunable)
+    Lx, Ly = 0.02, 0.2
+    Nx, Ny = 40, 200
+    RAD = 0.004
+    MARKERS = 2048
+    DT = 5e-5
+    STEPS = 100
+
+    # Physical parameters
+    HEAT_SOURCE_INTENSITY = 1.94
+    HEAT_FLUX = 6000
+    DENSITY = 145.5244
+    ENTROPY = 813.4
+    DENSITY_N = 68.22
+    DENSITY_S = 77.31
+    Vn_IN = HEAT_FLUX / (DENSITY * ENTROPY * HEAT_SOURCE_INTENSITY)
+    Vs_IN = -(DENSITY_N * Vn_IN) / DENSITY_S
+    Vn_BC, Vs_BC, J_BC, t_BC_THERMAL, p_BC = boundaries.get_cylinder_bcs(Vn_IN=Vn_IN, Vs_IN=Vs_IN, PRESSURE_0=3130)
+    DOMAIN = dict(x=Nx, y=Ny, bounds=Box(x=Lx, y=Ly))
+    SPHERE = Sphere(x=Lx/2, y=Ly/2, radius=RAD)
+    OBSTACLE = Obstacle(SPHERE)
+
+    # initialize GT fields
+    def _init_fields_from_csv_or_default(init_csv=None):
+        if init_csv is None:
+            v0 = StaggeredGrid(0, Vn_BC, **DOMAIN)
+            vs0 = StaggeredGrid(0, Vs_BC, **DOMAIN)
+            p0 = CenteredGrid(3130, p_BC, **DOMAIN)
+            t0 = CenteredGrid(HEAT_SOURCE_INTENSITY, t_BC_THERMAL, **DOMAIN)
+            L0 = CenteredGrid(0, ZERO_GRADIENT, **DOMAIN)
+            return v0, vs0, p0, t0, L0
+        try:
+            un0_np, un1_np, us0_np, us1_np, p_np, t_np, L_np, count_total = load_csv_to_grids_cyl(
+                init_csv, Lx=Lx, Ly=Ly, Nx=Nx, Ny=Ny
+            )
+            print(f'Loaded CSV init from {init_csv} with {count_total} samples')
+            t_grid = CenteredGrid(tensor(t_np.T, spatial('x,y')), t_BC_THERMAL, bounds=Box(x=Lx, y=Ly))
+            p_grid = CenteredGrid(tensor(p_np.T, spatial('x,y')), p_BC, bounds=Box(x=Lx, y=Ly))
+            L_grid = CenteredGrid(tensor(L_np.T, spatial('x,y')), ZERO_GRADIENT, bounds=Box(x=Lx, y=Ly))
+            un_center = CenteredGrid(tensor(np.stack([un0_np.T, un1_np.T], axis=-1), spatial('x,y'), channel(vector='x,y')), Vn_BC, bounds=Box(x=Lx, y=Ly))
+            vs_center = CenteredGrid(tensor(np.stack([us0_np.T, us1_np.T], axis=-1), spatial('x,y'), channel(vector='x,y')), Vs_BC, bounds=Box(x=Lx, y=Ly))
+            target_v_template = StaggeredGrid(0, Vn_BC, **DOMAIN)
+            v_stag = un_center.at(target_v_template)
+            target_vs_template = StaggeredGrid(0, Vs_BC, **DOMAIN)
+            vs_stag = vs_center.at(target_vs_template)
+            return v_stag, vs_stag, p_grid, t_grid, L_grid
+        except Exception as exc:
+            print(f'Failed to load CSV for initialization; using defaults. Reason: {exc}')
+            return StaggeredGrid(0, Vn_BC, **DOMAIN), StaggeredGrid(0, Vs_BC, **DOMAIN), CenteredGrid(3130, p_BC, **DOMAIN), CenteredGrid(HEAT_SOURCE_INTENSITY, t_BC_THERMAL, **DOMAIN), CenteredGrid(0, ZERO_GRADIENT, **DOMAIN)
+
+    
+    v0_gt0, vs0_gt0, p0_gt0, t0_gt0, L0_gt0 = _init_fields_from_csv_or_default(getattr(args, 'init_csv', None))
+
+    if OBSTACLE is not None:
+        obstacle_mask_vn = resample(~(OBSTACLE.geometry), v0_gt0)
+        v0_gt0 = field.safe_mul(obstacle_mask_vn, v0_gt0)
+        obstacle_mask_vs = resample(~(OBSTACLE.geometry), vs0_gt0)
+        vs0_gt0 = field.safe_mul(obstacle_mask_vs, vs0_gt0)
+        obstacle_mask_t = resample(~(OBSTACLE.geometry), t0_gt0)
+        t0_gt0 = field.safe_mul(obstacle_mask_t, t0_gt0)
+        obstacle_mask_L = resample(~(OBSTACLE.geometry), L0_gt0)
+        L0_gt0 = field.safe_mul(obstacle_mask_L, L0_gt0)
+
+    # Markers Initialization
+    markers0 = DOMAIN['bounds'].sample_uniform(instance(markers=MARKERS))
+    if OBSTACLE is not None:
+        markers0 = helium.constrain_markers_push(markers0, OBSTACLE)
+
+    # Simulate GT
+    curr_vn = v0_gt0
+    curr_vs = vs0_gt0
+    curr_p = p0_gt0
+    curr_t = t0_gt0
+    curr_L = L0_gt0
+    gt_traj = [markers0]
+    for _ in range(STEPS):
+        curr_vn, curr_vs, curr_p, curr_t, curr_L = helium.SFHelium_step(curr_vn, curr_vs, curr_p, curr_t, curr_L, dt=DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE, Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL)
+        markers0 = advect.points(markers0, curr_vn, dt=DT, integrator=advect.rk4)
+        try:
+            if OBSTACLE is not None:
+                markers0 = helium.constrain_markers_push(markers0, OBSTACLE)
+        except Exception:
+            pass
+        gt_traj.append(markers0)
+
+    gt_stack = math.stack(gt_traj, batch('time'))
+    gt_disp = []
+    for idx in range(len(gt_traj) - 1):
+        delta = gt_traj[idx + 1] - gt_traj[idx]
+        delta = math.where(math.is_finite(delta), delta, 0.0)
+        gt_disp.append(delta / DT)
+    gt_disp_stack = math.stack(gt_disp, batch('time_disp')) if gt_disp else None
+    print('GT Generation Done.')
+
+    # Inversion: run optimization unless user requested skip
+    v0_reconstructed = None
+    def _sanitize_staggered(v_field):
+        try:
+            vals = v_field.values
+            vals = math.where(math.is_finite(vals), vals, 0.0)
+            return StaggeredGrid(values=vals, extrapolation=v_field.extrapolation, bounds=v_field.bounds)
+        except Exception:
+            return v_field
+    def _sanitize_centered(c_field):
+        try:
+            vals = c_field.values
+            vals = math.where(math.is_finite(vals), vals, 0.0)
+            return CenteredGrid(values=vals, extrapolation=c_field.extrapolation, bounds=c_field.bounds)
+        except Exception:
+            return c_field
+    if not getattr(args, 'skip_inversion', False):
+        @jit_compile
+        def loss_function(v_guess_centered):
+            vn = v_guess_centered.at(v0_gt0)
+            markers = gt_traj[0]
+            traj = [markers]
+            v_curr = vn
+            vs_curr = vs0_gt0
+            p_curr = p0_gt0
+            t_curr = t0_gt0
+            L_curr = L0_gt0
+
+            if OBSTACLE is not None:
+                obstacle_mask_vn = resample(~(OBSTACLE.geometry), v_curr)
+                v_curr = field.safe_mul(obstacle_mask_vn, v_curr)
+                obstacle_mask_vs = resample(~(OBSTACLE.geometry), vs_curr)
+                vs_curr = field.safe_mul(obstacle_mask_vs, vs_curr)
+                obstacle_mask_t = resample(~(OBSTACLE.geometry), t_curr)
+                t_curr = field.safe_mul(obstacle_mask_t, t_curr)
+                obstacle_mask_L = resample(~(OBSTACLE.geometry), L_curr)
+                L_curr = field.safe_mul(obstacle_mask_L, L_curr)
+                markers = helium.constrain_markers_push(markers, OBSTACLE)
+
+            for _ in range(STEPS):
+                v_curr, vs_curr, p_curr, t_curr, L_curr = helium.SFHelium_step(
+                    v_curr, vs_curr, p_curr, t_curr, L_curr,
+                    dt=DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE,
+                    Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL
+                )
+                markers = advect.points(markers, v_curr, dt=DT, integrator=advect.rk4)
+                if OBSTACLE is not None:
+                    markers = helium.constrain_markers_push(markers, OBSTACLE)
+                traj.append(markers)
+
+            sim = math.stack(traj, batch('time'))
+            diff = sim - gt_stack
+            return math.sum(diff ** 2, dim=diff.shape)
+
+        guess_shape = v0_gt0.at_centers().values.shape
+        noise_scale = 0.005
+        noise = math.random_uniform(guess_shape, low=-noise_scale, high=noise_scale)
+        v_guess = CenteredGrid(values=noise, extrapolation=Vn_BC, bounds=Box(x=Lx, y=Ly))
+
+        print('Starting full L-BFGS-B refinement')
+        lbfgs_solver = Solve(
+            'L-BFGS-B',
+            x0=v_guess,
+            max_iterations=200,
+            # abs_tol=1e-18,
+            suppress=[phi.math.Diverged, phi.math.NotConverged]
+        )
+        with math.SolveTape(record_trajectories=False):
+            result_centered = minimize(
+                loss_function,
+                lbfgs_solver
+            )
+        print('Optimization completed')
+        result_centered = _sanitize_centered(result_centered)
+
+        v0_reconstructed = result_centered.at(v0_gt0)
+        v0_reconstructed = _sanitize_staggered(v0_reconstructed)
+    else:
+        v0_reconstructed = None
+
+    # ==============================================================================
+    # Prepare and save GT and reconstruction for visualization
+    # ==============================================================================
+
+    # Extract per-frame GT fields for inspection
+    v_gt_u, v_gt_v, v_gt_speed, v_gt_vec, vs_gt_u, vs_gt_v, vs_gt_speed, vs_gt_vec, t_gt = _extract_time_series_for_vn(
+        v0_gt0, vs0_gt0, p0_gt0, t0_gt0, L0_gt0, STEPS, DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE, Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL)
+
+    # Reconstruction fields (if inversion ran)
+    recon_traj = None
+    v_recon_u = v_recon_v = v_recon_speed = v_recon_vec = None
+    vs_recon_u = vs_recon_v = vs_recon_speed = vs_recon_vec = None
+    t_recon = None
+    if v0_reconstructed is not None:
+        v_recon_u, v_recon_v, v_recon_speed, v_recon_vec, vs_recon_u, vs_recon_v, vs_recon_speed, vs_recon_vec, t_recon = _extract_time_series_for_vn(
+            v0_reconstructed, vs0_gt0, p0_gt0, t0_gt0, L0_gt0, STEPS, DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE, Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL)
+
+        # Reconstruct particle trajectories advected by reconstructed normal fluid
+        try:
+            markers_rec = gt_traj[0]
+            recon_traj_list = [markers_rec]
+            v_curr = v0_reconstructed
+            vs_curr = vs0_gt0
+            p_curr = p0_gt0
+            t_curr = t0_gt0
+            L_curr = L0_gt0
+
+            if OBSTACLE is not None:
+                obstacle_mask_vn = resample(~(OBSTACLE.geometry), v_curr)
+                v_curr = field.safe_mul(obstacle_mask_vn, v_curr)
+                obstacle_mask_vs = resample(~(OBSTACLE.geometry), vs_curr)
+                vs_curr = field.safe_mul(obstacle_mask_vs, vs_curr)
+                obstacle_mask_t = resample(~(OBSTACLE.geometry), t_curr)
+                t_curr = field.safe_mul(obstacle_mask_t, t_curr)
+                obstacle_mask_L = resample(~(OBSTACLE.geometry), L_curr)
+                L_curr = field.safe_mul(obstacle_mask_L, L_curr)
+                markers_rec = helium.constrain_markers_push(markers_rec, OBSTACLE)
+            
+            for _ in range(STEPS):
+                v_curr, vs_curr, p_curr, t_curr, L_curr = helium.SFHelium_step(
+                    v_curr, vs_curr, p_curr, t_curr, L_curr,
+                    dt=DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE,
+                    Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL
+                )
+                markers_rec = advect.points(markers_rec, v_curr, dt=DT, integrator=advect.rk4)
+                if OBSTACLE is not None:
+                    markers_rec = helium.constrain_markers_push(markers_rec, OBSTACLE)
+                recon_traj_list.append(markers_rec)
+            recon_stack = math.stack(recon_traj_list, batch('time'))
+            recon_traj = _simple_to_numpy(recon_stack)
+        except Exception:
+            recon_traj = None
+
+    # Normalize and prepare temperature arrays
+    t_gt = _simple_to_numpy(t_gt) if 't_gt' in locals() else None
+    t_recon = _simple_to_numpy(t_recon) if 't_recon' in locals() else None
+    if t_gt is None and v_gt_speed is not None:
+        try:
+            t_gt = np.full(np.asarray(v_gt_speed).shape, np.nan, dtype=float)
+        except Exception:
+            t_gt = None
+    if t_recon is None and v_recon_speed is not None:
+        try:
+            t_recon = np.full(np.asarray(v_recon_speed).shape, np.nan, dtype=float)
+        except Exception:
+            t_recon = None
+
+    # Ensure arrays are numpy and have shape (T, H, W) or (H, W) before saving
+    def _prepare_save(x):
+        try:
+            a = _simple_to_numpy(x)
+        except Exception:
+            a = None
+        return _ensure_HW(a, Nx, Ny)
+
+    v_gt_u = _prepare_save(v_gt_u)
+    v_gt_v = _prepare_save(v_gt_v)
+    v_gt_speed = _prepare_save(v_gt_speed)
+    v_gt_vec = _prepare_save(v_gt_vec)
+    vs_gt_u = _prepare_save(vs_gt_u)
+    vs_gt_v = _prepare_save(vs_gt_v)
+    vs_gt_speed = _prepare_save(vs_gt_speed)
+    vs_gt_vec = _prepare_save(vs_gt_vec)
+
+    v_recon_u = _prepare_save(v_recon_u)
+    v_recon_v = _prepare_save(v_recon_v)
+    v_recon_speed = _prepare_save(v_recon_speed)
+    v_recon_vec = _prepare_save(v_recon_vec)
+    vs_recon_u = _prepare_save(vs_recon_u)
+    vs_recon_v = _prepare_save(vs_recon_v)
+    vs_recon_speed = _prepare_save(vs_recon_speed)
+    vs_recon_vec = _prepare_save(vs_recon_vec)
+
+    t_gt = _prepare_save(t_gt)
+    t_recon = _prepare_save(t_recon)
+
+    gt_np = _simple_to_numpy(gt_stack)
+    save_dict = dict(
+        success=1, gt=gt_np, recon=recon_traj,
+        v_gt_speed=v_gt_speed, v_recon_speed=v_recon_speed, v_gt_vec=v_gt_vec, v_recon_vec=v_recon_vec,
+        v_gt_u=v_gt_u, v_gt_v=v_gt_v, v_recon_u=v_recon_u, v_recon_v=v_recon_v,
+        vs_gt_speed=vs_gt_speed, vs_recon_speed=vs_recon_speed, vs_gt_vec=vs_gt_vec, vs_recon_vec=vs_recon_vec,
+        vs_gt_u=vs_gt_u, vs_gt_v=vs_gt_v, vs_recon_u=vs_recon_u, vs_recon_v=vs_recon_v,
+        t_gt=t_gt, t_recon=t_recon
+    )
+    io.save_npz('data/simulation/cyl_v0_recon.npz', **save_dict)
+
+    print('Task 03 complete. Data saved to data/simulation/cyl_v0_recon.npz')
+
+if __name__ == '__main__':
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from phi.jax.flow import *
+from .boundaries import get_sf_bcs
+import numpy as np
+
+# Properties of SFHelium
+VISCOSITY_N_COEFFS = [7.42116853e-04, -2.72872406e-03, 4.18086013e-03, -3.40692439e-03,
+               1.55634875e-03, -3.77813201e-04, 3.80801796e-05]
+
+RHO_N_COEFFS = [1.80183130e-01, -2.48558984e+01, 4.01282654e+02, -2.48742413e+03,
+                7.85114896e+03, -1.42666651e+04, 1.57974461e+04, -1.08279105e+04,
+                4.48686634e+03, -1.02983154e+03, 1.00498992e+02]
+
+RHO_S_COEFFS = [144.94795, 25.18243857, -406.9535624, 2509.83455, -7886.879518,
+                14286.34985, -15784.94029, 10803.13498, -4471.875738, 1025.612443, -100.0317144]
+
+ENTROPY_COEFFS = [6.57311375e+06, -4.38113590e+07, 1.30656739e+08, -2.29500549e+08,
+                  2.62852401e+08, -2.05055435e+08, 1.10322083e+08, -4.04131685e+07,
+                  9.64576203e+06, -1.35448196e+06, 8.49760567e+04]
+
+C1_COEFFS = [-37875.4603432003, 161027.467671278, -292620.794399981, 294653.759992904,
+             -177568.113431148, 64045.2095387393, -12802.0813284325, 1094.15041473176]
+
+C2_COEFFS = [2421.03719768316, -7059.46514061684, 8208.38710509775, -4758.60939944746,
+             1376.23800786335, -158.752493718344]
+
+C3_COEFFS = [-4.18764389500096, 8.88295312215358, -5.42845535938227, 1.49351622326385]
+
+B = 1.008
+KAPPA = 9.97e-8
+
+COLD_SOURCE_INTENSITY = 1.94
+
+# Pressure solver default (forward + gradient solve)
+PRESSURE_SOLVER = Solve(
+    'CG',
+    abs_tol=1e-10,
+    rel_tol=0,
+    max_iterations=2000,
+    suppress=[phi.math.NotConverged, phi.math.Diverged],
+    gradient_solve=Solve(
+        'CG',
+        abs_tol=1e-10,
+        rel_tol=0,
+        max_iterations=2000,
+        suppress=[phi.math.NotConverged, phi.math.Diverged]
+    )
+)
+
+# PropSolver and SFHelium_step
+@jit_compile
+def PropSolver(t):
+    t = field.maximum(t, 1.7)
+    t = field.minimum(t, 2.17)
+    def poly_eval(coeffs, t_field):
+        res = 0.0
+        for power, coeff in enumerate(coeffs):
+            res += coeff * (t_field ** power)
+        return res
+    def poly_deriv(coeffs, t_field):
+        res = 0.0
+        for power, coeff in enumerate(coeffs):
+            if power > 0:
+                res += power * coeff * (t_field ** (power-1))
+        return res
+    VISCOSITY_N = poly_eval(VISCOSITY_N_COEFFS, t)
+    RHO_N = poly_eval(RHO_N_COEFFS, t)
+    RHO_S = poly_eval(RHO_S_COEFFS, t)
+    RHO_N = field.maximum(RHO_N, 0.0)
+    RHO_S = field.maximum(RHO_S, 0.0)
+    RHO = RHO_N + RHO_S
+    RHO = field.maximum(RHO, 100.0)
+    dRHO_NdT = poly_deriv(RHO_N_COEFFS, t)
+    dRHO_SdT = poly_deriv(RHO_S_COEFFS, t)
+    dRHOdT = dRHO_NdT + dRHO_SdT
+    ENTROPY = poly_eval(ENTROPY_COEFFS, t)
+    dSdT = poly_deriv(ENTROPY_COEFFS, t)
+    C1 = poly_eval(C1_COEFFS, t)
+    alpha_v = C1/1e6 * RHO_S * ENTROPY * t
+    C2 = poly_eval(C2_COEFFS, t)
+    beta_v = C2/1e8
+    C3 = poly_eval(C3_COEFFS, t)
+    gamma_v = math.exp(math.log(10) * C3) * (100**4.5)
+    return VISCOSITY_N, RHO_N, RHO_S, RHO, dRHOdT, ENTROPY, dSdT, alpha_v, beta_v, gamma_v
+
+def SFHelium_step(vn, vs, p, t, L, dt, DOMAIN=None, OBSTACLE=None, Vn_BC=None, Vs_BC=None, t_BC_THERMAL=None, PRESSURE_SOLVER=PRESSURE_SOLVER):
+    # Prevent numerical issues
+    EPSILON = 1e-8
+    MAX_VEL_FORCE = 500.0
+    MAX_W_MAG_FOR_L = 100.0
+
+    # 1. Get physical properties
+    VISCOSITY_N, RHO_N, RHO_S, RHO, dRHOdT, ENTROPY, dSdT, alpha_v, beta_v, gamma_v = PropSolver(t)
+    
+    RHO   = field.maximum(RHO, EPSILON)
+    RHO_N = field.maximum(RHO_N, EPSILON)
+    RHO_S = field.maximum(RHO_S, EPSILON)
+    
+    # 2. BCs adjustment 
+    y_coords = t.points.vector['y']
+    Ly = 0.0016
+    Ny = 80
+    # Ly = 0.5
+    # Ny = 200
+
+    sponge_top = Ly - Ly/Ny
+    steepness = 20000.0
+    cooling_zone = math.sigmoid((y_coords - sponge_top) * steepness)
+    cooling_rate = 50.0
+    
+    t = t - cooling_zone * cooling_rate * (t - COLD_SOURCE_INTENSITY) * dt/2
+
+    # 3. Advection
+    vn = advect.semi_lagrangian(vn, vn, dt)
+    vs = advect.semi_lagrangian(vs, vs, dt)
+    t  = advect.semi_lagrangian(t,  vn, dt)
+
+    # 4. Viscosity
+    laplacian_vn = field.laplace(vn)
+    vn = vn + (VISCOSITY_N * dt * laplacian_vn.at(t)).at(vn)
+
+    # 5. Thermal-mechanical effects
+    grad_k_n = field.spatial_gradient(0.5 * field.vec_squared(vn.at(t)), Vn_BC).at(vn)
+    grad_t_n = field.spatial_gradient(t, Vn_BC).at(vn)
+    grad_k_s = field.spatial_gradient(0.5 * field.vec_squared(vs.at(t)), Vs_BC).at(vs)
+    grad_t_s = field.spatial_gradient(t, Vs_BC).at(vs)
+
+    coeff_S_n = (RHO_S/RHO_N * ENTROPY).at(vn)
+    coeff_K_n = (RHO_S/RHO).at(vn)
+    CHEM_POTENTIAL_n = - coeff_S_n * grad_t_n - coeff_K_n * grad_k_n
+
+    coeff_S_s = ENTROPY.at(vs)
+    coeff_K_s = (RHO_N/RHO).at(vs)
+    CHEM_POTENTIAL_s = - coeff_S_s * grad_t_s - coeff_K_s * grad_k_s
+
+    CHEM_POTENTIAL_n = field.minimum(field.maximum(CHEM_POTENTIAL_n, -MAX_VEL_FORCE), MAX_VEL_FORCE)
+    CHEM_POTENTIAL_s = field.minimum(field.maximum(CHEM_POTENTIAL_s, -MAX_VEL_FORCE), MAX_VEL_FORCE)
+
+    vn = vn + CHEM_POTENTIAL_n * dt
+    vs = vs - CHEM_POTENTIAL_s * dt
+
+    # ==============================================================================
+    # 6. Mutual friction and Vinen equation (Sub-cycling)
+    # ==============================================================================
+    sub_steps = 5 
+    dt_sub = dt / sub_steps
+    
+    rho_ratio_s = (RHO_S / RHO)
+    rho_ratio_n = (RHO_N / RHO)
+
+    for _ in range(sub_steps):
+        # --- A. Initialization ---
+        vn_centered = vn.at(t)
+        vs_centered = vs.at(t)
+        L_centered  = L.at(t)
+        
+        vns_vec = vn_centered - vs_centered
+        w_sq = field.vec_squared(vns_vec)
+        w_mag = field.vec_length(vns_vec)
+        vs_mag = field.vec_length(vs_centered)
+        w_mag_safe = field.maximum(w_mag, EPSILON)
+        vs_mag_safe = field.maximum(vs_mag, EPSILON)
+        
+        # --- B. Vinen Equation ---
+        safe_L_sqrt = math.sqrt(field.maximum(L_centered, 0.0))
+        
+        term1 = -2.4 * KAPPA * safe_L_sqrt
+        term2 = -(RHO_N/RHO) * w_mag_safe # 使用 safe mag
+        
+        vL_scalar = (term1 + term2) / vs_mag_safe
+        
+        MAX_V_VAL = 100.0
+        vL_scalar = field.minimum(field.maximum(vL_scalar, -MAX_V_VAL), MAX_V_VAL)
+        
+        vL_vec = vL_scalar * vs_centered # assuming vL along vs direction
+        
+        # Advection of L
+        L = advect.semi_lagrangian(L, vL_vec, dt_sub)
+        MAX_L_VAL = 1e8
+        L = field.minimum(field.maximum(L, 0.0), MAX_L_VAL)
+        L_centered = L.at(t)
+        
+        # Production and decay terms
+        w_mag_for_prod = field.minimum(w_mag_safe, MAX_W_MAG_FOR_L)
+        
+        term_prod = alpha_v * w_mag_for_prod * (L_centered ** 1.5)
+        term_nucl = gamma_v * (w_mag_for_prod ** 2.5) 
+        
+        L_source = term_prod + term_nucl
+        denom = 1.0 + dt_sub * beta_v * L_centered
+        denom = field.maximum(denom, EPSILON)
+        
+        L_new_center = (L_centered + dt_sub * L_source) / denom
+        L_new_center = field.minimum(field.maximum(L_new_center, 0.0), MAX_L_VAL)
+        
+        L = L.with_values(L_new_center)
+        
+        # --- C. Mutual friction (Analytical Decay) ---
+        # Using exponential decay method, unconditionally stable
+        
+        # Calculate the inverse of the decay time constant: 1/tau_decay ~ Friction Frequency
+        # F_friction ~ - (B kappa / 3) * L * w
+        freq = (B / 3.0 * KAPPA) * L_new_center
+        
+        # Computing Decay Factor: exp(-freq * dt)
+        # If freq * dt is large, decay -> 0 (completely locked)
+        # If freq * dt is small, decay -> 1 (no friction)
+        change_factor = 1.0 - field.exp(-freq * dt_sub)
+        
+        # Interpolate to staggered grid
+        alpha_at_vn = change_factor.at(vn)
+        alpha_at_vs = change_factor.at(vs)
+        
+        vs_at_vn = vs.at(t).at(vn)
+        vn_at_vs = vn.at(t).at(vs)
+        
+        vn = vn + (rho_ratio_s.at(vn) * alpha_at_vn) * (vs_at_vn - vn)
+        vs = vs + (rho_ratio_n.at(vs) * alpha_at_vs) * (vn_at_vs - vs)
+
+    
+    # 7. Thermodynamic Dissipation
+    vn_centered_final = vn.at(t)
+    vs_centered_final = vs.at(t)
+    vns_final = vn_centered_final - vs_centered_final
+    
+    L_final = L.at(t)
+    B_coeff_final = (B / 3.0 * KAPPA) * L_final
+    Fns_coeff_final = B_coeff_final * (RHO_S/RHO) 
+    
+    dissipation_energy = Fns_coeff_final * field.vec_squared(vns_final)
+    
+    heat_capacity = t * (ENTROPY * dRHOdT + RHO * dSdT)
+    heat_capacity = field.maximum(heat_capacity, 1e-5)
+    
+    t_dissipa = dissipation_energy / heat_capacity
+    t = t + t_dissipa * dt
+    t = t - cooling_zone * cooling_rate * (t - COLD_SOURCE_INTENSITY) * dt/2
+    
+    # update BCs
+    vn = StaggeredGrid(vn, Vn_BC, **DOMAIN)
+    vs = StaggeredGrid(vs, Vs_BC, **DOMAIN)
+    t = CenteredGrid(t, t_BC_THERMAL, **DOMAIN)
+    L = CenteredGrid(L, ZERO_GRADIENT, **DOMAIN)
+    p = CenteredGrid(p, ZERO_GRADIENT, **DOMAIN)
+
+    # 8. Obstacle Handling
+    if OBSTACLE is not None:
+        obstacle_mask_vn = resample(~(OBSTACLE.geometry), vn)
+        vn = field.safe_mul(obstacle_mask_vn, vn)
+        obstacle_mask_vs = resample(~(OBSTACLE.geometry), vs)
+        vs = field.safe_mul(obstacle_mask_vs, vs)
+        obstacle_mask_t = resample(~(OBSTACLE.geometry), t)
+        t = field.safe_mul(obstacle_mask_t, t)
+        obstacle_mask_L = resample(~(OBSTACLE.geometry), L)
+        L = field.safe_mul(obstacle_mask_L, L)
+
+    # update BCs
+    vn = StaggeredGrid(vn, Vn_BC, **DOMAIN)
+    vs = StaggeredGrid(vs, Vs_BC, **DOMAIN)
+    t = CenteredGrid(t, t_BC_THERMAL, **DOMAIN)
+    L = CenteredGrid(L, ZERO_GRADIENT, **DOMAIN)
+    p = CenteredGrid(p, ZERO_GRADIENT, **DOMAIN)
+    
+    # 9. Pressure Projection
+    vn, p_n = fluid.make_incompressible(vn, OBSTACLE or (), PRESSURE_SOLVER)
+    vs, p_s = fluid.make_incompressible(vs, OBSTACLE or (), PRESSURE_SOLVER)
+
+    p = RHO.at(p) * (p_n.at(p) + p_s.at(p)) * 0.5
+    
+    return vn, vs, p, t, L
+
+# Constrain Markers
+@jit_compile
+def constrain_markers_push(markers, sphere_obstacle):
+    center = sphere_obstacle.geometry.center
+    radius = sphere_obstacle.geometry.radius
+    diff = markers - center
+    dist = math.vec_length(diff)
+    epsilon = 1e-4
+    correction = center + (diff / (dist + 1e-6)) * (radius + epsilon)
+    is_inside = dist < radius
+    fixed_markers = math.where(is_inside, correction, markers)
+    return fixed_markers
+
+
+"""
+Task 03: Cylinder flow simulation/inversion (uses SFHelium model)
+
+"""
+from phi.jax.flow import *
+from sf_recon.physics import helium, boundaries
+from sf_recon.utils import viz, io
+from sf_recon.utils.load import load_csv_to_grids_cyl
+from sf_recon.utils.saving import (
+    simple_to_numpy as _simple_to_numpy,
+    stack_if_possible as _stack_if_possible,
+    extract_time_series_for_vn as _extract_time_series_for_vn,
+    ensure_HW as _ensure_HW,
+)
+import argparse
+import numpy as np
+import time
+
+def main():
+    # Choose initialization with external CSV if provided
+    # Choose whether to skip inversion
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--init-csv', type=str, default=None, help='Optional OpenFOAM-export CSV to initialize fields')
+    parser.add_argument('--skip-inversion', action='store_true', help='Skip the inversion step')
+    parser.add_argument('--nn-iters', type=int, default=100, help='Training iterations for U-Net optimization')
+    parser.add_argument('--nn-lr', type=float, default=1e-2, help='Learning rate for U-Net optimization')
+    parser.add_argument('--train-steps', type=int, default=None, help='Subsample time steps for faster training')
+    parser.add_argument('--train-markers', type=int, default=None, help='Subsample markers for faster training')
+    args = parser.parse_args()
+
+    math.use('jax')
+    math.set_global_precision(64)
+
+    print('Task 03: starting')
+    # Domain and simulation parameters (tunable)
+    Lx, Ly = 0.02, 0.2
+    Nx, Ny = 40, 200
+    RAD = 0.004
+    MARKERS = 4096
+    DT = 5e-5
+    STEPS = 2
+    LOSS_SCALE = 1e12  # Scale tiny marker displacements to O(1)
+    VEL_SCALE = 50.0  # Smooth clamp for predicted velocity
+    REG_WEIGHT = 1e-6  # Small weight decay to keep gradients active
+    SUP_WEIGHT = 1.0  # Supervised velocity weight
+    PHYS_WEIGHT = 1e-3  # Small physics term (no gradients) for monitoring
+
+    # Physical parameters
+    HEAT_SOURCE_INTENSITY = 1.94
+    HEAT_FLUX = 6000
+    DENSITY = 145.5244
+    ENTROPY = 813.4
+    DENSITY_N = 68.22
+    DENSITY_S = 77.31
+    Vn_IN = HEAT_FLUX / (DENSITY * ENTROPY * HEAT_SOURCE_INTENSITY)
+    Vs_IN = -(DENSITY_N * Vn_IN) / DENSITY_S
+    Vn_BC, Vs_BC, J_BC, t_BC_THERMAL, p_BC = boundaries.get_cylinder_bcs(Vn_IN=Vn_IN, Vs_IN=Vs_IN, PRESSURE_0=3130)
+    DOMAIN = dict(x=Nx, y=Ny, bounds=Box(x=Lx, y=Ly))
+    SPHERE = Sphere(x=Lx/2, y=Ly/2, radius=RAD)
+    OBSTACLE = Obstacle(SPHERE)
+
+    # initialize GT fields
+    def _init_fields_from_csv_or_default(init_csv=None):
+        if init_csv is None:
+            v0 = StaggeredGrid(0, Vn_BC, **DOMAIN)
+            vs0 = StaggeredGrid(0, Vs_BC, **DOMAIN)
+            p0 = CenteredGrid(3130, p_BC, **DOMAIN)
+            t0 = CenteredGrid(HEAT_SOURCE_INTENSITY, t_BC_THERMAL, **DOMAIN)
+            L0 = CenteredGrid(0, ZERO_GRADIENT, **DOMAIN)
+            return v0, vs0, p0, t0, L0
+        try:
+            un0_np, un1_np, us0_np, us1_np, p_np, t_np, L_np, count_total = load_csv_to_grids_cyl(
+                init_csv, Lx=Lx, Ly=Ly, Nx=Nx, Ny=Ny
+            )
+            print(f'Loaded CSV init from {init_csv} with {count_total} samples')
+            t_grid = CenteredGrid(tensor(t_np.T, spatial('x,y')), t_BC_THERMAL, bounds=Box(x=Lx, y=Ly))
+            p_grid = CenteredGrid(tensor(p_np.T, spatial('x,y')), p_BC, bounds=Box(x=Lx, y=Ly))
+            L_grid = CenteredGrid(tensor(L_np.T, spatial('x,y')), ZERO_GRADIENT, bounds=Box(x=Lx, y=Ly))
+            un_center = CenteredGrid(tensor(np.stack([un0_np.T, un1_np.T], axis=-1), spatial('x,y'), channel(vector='x,y')), Vn_BC, bounds=Box(x=Lx, y=Ly))
+            vs_center = CenteredGrid(tensor(np.stack([us0_np.T, us1_np.T], axis=-1), spatial('x,y'), channel(vector='x,y')), Vs_BC, bounds=Box(x=Lx, y=Ly))
+            target_v_template = StaggeredGrid(0, Vn_BC, **DOMAIN)
+            v_stag = un_center.at(target_v_template)
+            target_vs_template = StaggeredGrid(0, Vs_BC, **DOMAIN)
+            vs_stag = vs_center.at(target_vs_template)
+            return v_stag, vs_stag, p_grid, t_grid, L_grid
+        except Exception as exc:
+            print(f'Failed to load CSV for initialization; using defaults. Reason: {exc}')
+            return StaggeredGrid(0, Vn_BC, **DOMAIN), StaggeredGrid(0, Vs_BC, **DOMAIN), CenteredGrid(3130, p_BC, **DOMAIN), CenteredGrid(HEAT_SOURCE_INTENSITY, t_BC_THERMAL, **DOMAIN), CenteredGrid(0, ZERO_GRADIENT, **DOMAIN)
+
+    
+    v0_gt0, vs0_gt0, p0_gt0, t0_gt0, L0_gt0 = _init_fields_from_csv_or_default(getattr(args, 'init_csv', None))
+
+    if OBSTACLE is not None:
+        obstacle_mask_vn = resample(~(OBSTACLE.geometry), v0_gt0)
+        v0_gt0 = field.safe_mul(obstacle_mask_vn, v0_gt0)
+        obstacle_mask_vs = resample(~(OBSTACLE.geometry), vs0_gt0)
+        vs0_gt0 = field.safe_mul(obstacle_mask_vs, vs0_gt0)
+        obstacle_mask_t = resample(~(OBSTACLE.geometry), t0_gt0)
+        t0_gt0 = field.safe_mul(obstacle_mask_t, t0_gt0)
+        obstacle_mask_L = resample(~(OBSTACLE.geometry), L0_gt0)
+        L0_gt0 = field.safe_mul(obstacle_mask_L, L0_gt0)
+
+    # Markers Initialization
+    markers0 = DOMAIN['bounds'].sample_uniform(instance(markers=MARKERS))
+    if OBSTACLE is not None:
+        markers0 = helium.constrain_markers_push(markers0, OBSTACLE)
+
+    # Simulate GT
+    curr_vn = v0_gt0
+    curr_vs = vs0_gt0
+    curr_p = p0_gt0
+    curr_t = t0_gt0
+    curr_L = L0_gt0
+    gt_traj = [markers0]
+    for _ in range(STEPS):
+        curr_vn, curr_vs, curr_p, curr_t, curr_L = helium.SFHelium_step(curr_vn, curr_vs, curr_p, curr_t, curr_L, dt=DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE, Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL)
+        markers0 = advect.points(markers0, curr_vn, dt=DT, integrator=advect.rk4)
+        try:
+            if OBSTACLE is not None:
+                markers0 = helium.constrain_markers_push(markers0, OBSTACLE)
+        except Exception:
+            pass
+        gt_traj.append(markers0)
+
+    gt_stack = math.stack(gt_traj, batch('time'))
+    gt_disp = []
+    for idx in range(len(gt_traj) - 1):
+        delta = gt_traj[idx + 1] - gt_traj[idx]
+        delta = math.where(math.is_finite(delta), delta, 0.0)
+        gt_disp.append(delta / DT)
+    gt_disp_stack = math.stack(gt_disp, batch('time_disp')) if gt_disp else None
+    print('GT Generation Done.')
+
+    def _subsample_markers(markers_tensor):
+        if args.train_markers is None or args.train_markers >= MARKERS:
+            return markers_tensor
+        stride = max(1, MARKERS // args.train_markers)
+        try:
+            return markers_tensor.markers[::stride]
+        except Exception:
+            return markers_tensor
+
+    train_steps = STEPS if args.train_steps is None else max(1, min(STEPS, args.train_steps))
+    train_gt_traj = [_subsample_markers(step) for step in gt_traj[:train_steps + 1]]
+    train_gt_stack = math.stack(train_gt_traj, batch('time'))
+
+    # Inversion: run optimization unless user requested skip
+    v0_reconstructed = None
+    def _sanitize_staggered(v_field):
+        try:
+            vals = v_field.values
+            vals = math.where(math.is_finite(vals), vals, 0.0)
+            return StaggeredGrid(values=vals, extrapolation=v_field.extrapolation, bounds=v_field.bounds)
+        except Exception:
+            return v_field
+    def _sanitize_centered(c_field):
+        try:
+            vals = c_field.values
+            vals = math.where(math.is_finite(vals), vals, 0.0)
+            return CenteredGrid(values=vals, extrapolation=c_field.extrapolation, bounds=c_field.bounds)
+        except Exception:
+            return c_field
+    if not getattr(args, 'skip_inversion', False):
+        def _loss_function_raw(v_guess_centered):
+            vn = v_guess_centered.at(v0_gt0)
+            markers = train_gt_traj[0]
+            traj = [markers]
+            v_curr = vn
+            vs_curr = vs0_gt0
+            p_curr = p0_gt0
+            t_curr = t0_gt0
+            L_curr = L0_gt0
+
+            if OBSTACLE is not None:
+                obstacle_mask_vn = resample(~(OBSTACLE.geometry), v_curr)
+                v_curr = field.safe_mul(obstacle_mask_vn, v_curr)
+                obstacle_mask_vs = resample(~(OBSTACLE.geometry), vs_curr)
+                vs_curr = field.safe_mul(obstacle_mask_vs, vs_curr)
+                obstacle_mask_t = resample(~(OBSTACLE.geometry), t_curr)
+                t_curr = field.safe_mul(obstacle_mask_t, t_curr)
+                obstacle_mask_L = resample(~(OBSTACLE.geometry), L_curr)
+                L_curr = field.safe_mul(obstacle_mask_L, L_curr)
+                markers = helium.constrain_markers_push(markers, OBSTACLE)
+
+            for _ in range(train_steps):
+                v_curr, vs_curr, p_curr, t_curr, L_curr = helium.SFHelium_step(
+                    v_curr, vs_curr, p_curr, t_curr, L_curr,
+                    dt=DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE,
+                    Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL
+                )
+                markers = advect.points(markers, v_curr, dt=DT, integrator=advect.rk4)
+                if OBSTACLE is not None:
+                    markers = helium.constrain_markers_push(markers, OBSTACLE)
+                traj.append(markers)
+
+            sim = math.stack(traj, batch('time'))
+            diff = sim - train_gt_stack
+            diff = math.where(math.is_finite(diff), diff, 0.0)
+            # Average over time/markers and rescale to keep loss near 1
+            loss = math.mean(diff ** 2, dim=diff.shape) * LOSS_SCALE
+            return math.where(math.is_finite(loss), loss, math.tensor(1e6))
+
+        loss_function = jit_compile(_loss_function_raw)
+
+        guess_shape = v0_gt0.at_centers().values.shape
+        noise_scale = 0.005
+        noise = math.random_uniform(guess_shape, low=-noise_scale, high=noise_scale)
+        base_guess = v0_gt0.at_centers().values
+        # Initialize from GT + noise so it's easy to tune
+        v_guess = CenteredGrid(values=base_guess + noise, extrapolation=Vn_BC, bounds=Box(x=Lx, y=Ly))
+
+        print('Starting U-Net training')
+
+        # U-Net training (2D) following PhiML Networks examples
+        from phiml import nn as phiml_nn
+        net = phiml_nn.u_net(in_channels=2, out_channels=2, in_spatial=2)
+
+        def _ensure_net_parameters(network):
+            if getattr(network, 'parameters', None) is not None:
+                return
+            init_fn = getattr(network, 'initialize', None)
+            if callable(init_fn):
+                try:
+                    init_fn()
+                except Exception:
+                    pass
+            if getattr(network, 'parameters', None) is None:
+                try:
+                    from phiml.backend.jax import stax_nets as _stax_nets
+                    rnd_key = _stax_nets.JAX.rnd_key
+                    _stax_nets.JAX.rnd_key, init_key = _stax_nets.random.split(rnd_key)
+                    _, params64 = network._initialize(init_key, input_shape=network._input_shape)
+                    network.parameters = params64
+                except Exception:
+                    pass
+
+        _ensure_net_parameters(net)
+        optimizer = phiml_nn.adam(net, learning_rate=args.nn_lr)
+        train_x = v_guess.values
+
+        try:
+            init_pred = math.native_call(net, train_x)
+            init_pred_centered = CenteredGrid(values=init_pred, extrapolation=Vn_BC, bounds=Box(x=Lx, y=Ly))
+            init_loss = _loss_function_raw(init_pred_centered)
+            print(f'Initial loss (net): {float(init_loss):.10g}')
+        except Exception:
+            pass
+
+        def unet_loss(x_tensor):
+            # Prediction: velocity field -> supervised match to initial guess
+            pred = math.native_call(net, x_tensor)
+            pred = math.where(math.is_finite(pred), pred, 0.0)
+            # Bound velocities without triggering JAX tracer conversion
+            pred = math.clip(pred, -VEL_SCALE, VEL_SCALE)
+            pred_centered = CenteredGrid(values=pred, extrapolation=Vn_BC, bounds=Box(x=Lx, y=Ly))
+            physics = _loss_function_raw(pred_centered)
+            physics = math.where(math.is_finite(physics), physics, math.tensor(0.0))
+            reg = REG_WEIGHT * math.mean(pred ** 2, dim=pred.shape)
+            sup = SUP_WEIGHT * math.mean((pred - x_tensor) ** 2, dim=pred.shape)
+            return sup + reg + PHYS_WEIGHT * math.stop_gradient(physics)
+
+        unet_loss = jit_compile(unet_loss)
+
+        for it in range(args.nn_iters):
+            loss_value = phiml_nn.update_weights(net, optimizer, unet_loss, train_x)
+            if not math.all(math.is_finite(loss_value)).all:
+                print(f'U-Net iter {it + 1}/{args.nn_iters}: loss became non-finite, stopping early.')
+                break
+            if (it + 1) % 50 == 0:
+                try:
+                    pred_dbg = math.native_call(net, train_x)
+                    pred_dbg = math.clip(pred_dbg, -VEL_SCALE, VEL_SCALE)
+                    physics_dbg = _loss_function_raw(CenteredGrid(values=pred_dbg, extrapolation=Vn_BC, bounds=Box(x=Lx, y=Ly)))
+                    sup_dbg = SUP_WEIGHT * math.mean((pred_dbg - train_x) ** 2, dim=pred_dbg.shape)
+                    print(
+                        f'U-Net iter {it + 1}/{args.nn_iters}: '
+                        f'loss={float(loss_value):.10g}, '
+                        f'sup={float(sup_dbg):.10g}, '
+                        f'physics={float(physics_dbg):.10g}'
+                    )
+                except Exception:
+                    print(f'U-Net iter {it + 1}/{args.nn_iters}: loss={float(loss_value):.10g}')
+
+        pred_centered = _sanitize_centered(CenteredGrid(values=math.native_call(net, train_x), extrapolation=Vn_BC, bounds=Box(x=Lx, y=Ly)))
+        v0_reconstructed = _sanitize_staggered(pred_centered.at(v0_gt0))
+        try:
+            final_loss = _loss_function_raw(pred_centered)
+            print(f'Final loss: {float(final_loss):.10g}')
+        except Exception:
+            pass
+    else:
+        v0_reconstructed = None
+
+    # ==============================================================================
+    # Prepare and save GT and reconstruction for visualization
+    # ==============================================================================
+
+    # Extract per-frame GT fields for inspection
+    v_gt_u, v_gt_v, v_gt_speed, v_gt_vec, vs_gt_u, vs_gt_v, vs_gt_speed, vs_gt_vec, t_gt = _extract_time_series_for_vn(
+        v0_gt0, vs0_gt0, p0_gt0, t0_gt0, L0_gt0, STEPS, DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE, Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL)
+
+    # Reconstruction fields (if inversion ran)
+    recon_traj = None
+    v_recon_u = v_recon_v = v_recon_speed = v_recon_vec = None
+    vs_recon_u = vs_recon_v = vs_recon_speed = vs_recon_vec = None
+    t_recon = None
+    if v0_reconstructed is not None:
+        v_recon_u, v_recon_v, v_recon_speed, v_recon_vec, vs_recon_u, vs_recon_v, vs_recon_speed, vs_recon_vec, t_recon = _extract_time_series_for_vn(
+            v0_reconstructed, vs0_gt0, p0_gt0, t0_gt0, L0_gt0, STEPS, DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE, Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL)
+
+        # Reconstruct particle trajectories advected by reconstructed normal fluid
+        try:
+            markers_rec = gt_traj[0]
+            recon_traj_list = [markers_rec]
+            v_curr = v0_reconstructed
+            vs_curr = vs0_gt0
+            p_curr = p0_gt0
+            t_curr = t0_gt0
+            L_curr = L0_gt0
+
+            if OBSTACLE is not None:
+                obstacle_mask_vn = resample(~(OBSTACLE.geometry), v_curr)
+                v_curr = field.safe_mul(obstacle_mask_vn, v_curr)
+                obstacle_mask_vs = resample(~(OBSTACLE.geometry), vs_curr)
+                vs_curr = field.safe_mul(obstacle_mask_vs, vs_curr)
+                obstacle_mask_t = resample(~(OBSTACLE.geometry), t_curr)
+                t_curr = field.safe_mul(obstacle_mask_t, t_curr)
+                obstacle_mask_L = resample(~(OBSTACLE.geometry), L_curr)
+                L_curr = field.safe_mul(obstacle_mask_L, L_curr)
+                markers_rec = helium.constrain_markers_push(markers_rec, OBSTACLE)
+            
+            for _ in range(STEPS):
+                v_curr, vs_curr, p_curr, t_curr, L_curr = helium.SFHelium_step(
+                    v_curr, vs_curr, p_curr, t_curr, L_curr,
+                    dt=DT, DOMAIN=DOMAIN, OBSTACLE=OBSTACLE,
+                    Vn_BC=Vn_BC, Vs_BC=Vs_BC, t_BC_THERMAL=t_BC_THERMAL
+                )
+                markers_rec = advect.points(markers_rec, v_curr, dt=DT, integrator=advect.rk4)
+                if OBSTACLE is not None:
+                    markers_rec = helium.constrain_markers_push(markers_rec, OBSTACLE)
+                recon_traj_list.append(markers_rec)
+            recon_stack = math.stack(recon_traj_list, batch('time'))
+            recon_traj = _simple_to_numpy(recon_stack)
+        except Exception:
+            recon_traj = None
+
+    # Normalize and prepare temperature arrays
+    t_gt = _simple_to_numpy(t_gt) if 't_gt' in locals() else None
+    t_recon = _simple_to_numpy(t_recon) if 't_recon' in locals() else None
+    if t_gt is None and v_gt_speed is not None:
+        try:
+            t_gt = np.full(np.asarray(v_gt_speed).shape, np.nan, dtype=float)
+        except Exception:
+            t_gt = None
+    if t_recon is None and v_recon_speed is not None:
+        try:
+            t_recon = np.full(np.asarray(v_recon_speed).shape, np.nan, dtype=float)
+        except Exception:
+            t_recon = None
+
+    # Ensure arrays are numpy and have shape (T, H, W) or (H, W) before saving
+    def _prepare_save(x):
+        try:
+            a = _simple_to_numpy(x)
+        except Exception:
+            a = None
+        return _ensure_HW(a, Nx, Ny)
+
+    v_gt_u = _prepare_save(v_gt_u)
+    v_gt_v = _prepare_save(v_gt_v)
+    v_gt_speed = _prepare_save(v_gt_speed)
+    v_gt_vec = _prepare_save(v_gt_vec)
+    vs_gt_u = _prepare_save(vs_gt_u)
+    vs_gt_v = _prepare_save(vs_gt_v)
+    vs_gt_speed = _prepare_save(vs_gt_speed)
+    vs_gt_vec = _prepare_save(vs_gt_vec)
+
+    v_recon_u = _prepare_save(v_recon_u)
+    v_recon_v = _prepare_save(v_recon_v)
+    v_recon_speed = _prepare_save(v_recon_speed)
+    v_recon_vec = _prepare_save(v_recon_vec)
+    vs_recon_u = _prepare_save(vs_recon_u)
+    vs_recon_v = _prepare_save(vs_recon_v)
+    vs_recon_speed = _prepare_save(vs_recon_speed)
+    vs_recon_vec = _prepare_save(vs_recon_vec)
+
+    t_gt = _prepare_save(t_gt)
+    t_recon = _prepare_save(t_recon)
+
+    gt_np = _simple_to_numpy(gt_stack)
+    save_dict = dict(
+        success=1, gt=gt_np, recon=recon_traj,
+        v_gt_speed=v_gt_speed, v_recon_speed=v_recon_speed, v_gt_vec=v_gt_vec, v_recon_vec=v_recon_vec,
+        v_gt_u=v_gt_u, v_gt_v=v_gt_v, v_recon_u=v_recon_u, v_recon_v=v_recon_v,
+        vs_gt_speed=vs_gt_speed, vs_recon_speed=vs_recon_speed, vs_gt_vec=vs_gt_vec, vs_recon_vec=vs_recon_vec,
+        vs_gt_u=vs_gt_u, vs_gt_v=vs_gt_v, vs_recon_u=vs_recon_u, vs_recon_v=vs_recon_v,
+        t_gt=t_gt, t_recon=t_recon
+    )
+    io.save_npz('data/simulation/cyl_v0_recon.npz', **save_dict)
+
+    print('Task 03 complete. Data saved to data/simulation/cyl_v0_recon.npz')
+
+if __name__ == '__main__':
+    main()
