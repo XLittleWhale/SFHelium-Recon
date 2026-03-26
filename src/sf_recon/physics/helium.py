@@ -28,7 +28,14 @@ C3_COEFFS = [-4.18764389500096, 8.88295312215358, -5.42845535938227, 1.493516223
 B = 1.008
 KAPPA = 9.97e-8
 
-COLD_SOURCE_INTENSITY = 1.85  #1.94
+COLD_SOURCE_INTENSITY = 2.00  #1.94
+
+
+def _scale_gradient(x, scale):
+    """Keep forward value while scaling backward gradient by `scale` in [0, 1]."""
+    s = float(scale)
+    s = 0.0 if s < 0.0 else (1.0 if s > 1.0 else s)
+    return math.stop_gradient(x) * (1.0 - s) + x * s
 
 # Pressure solver default (forward + gradient solve)
 PRESSURE_SOLVER = Solve(
@@ -85,12 +92,20 @@ def PropSolver(t):
 def SFHelium_step(vn, vs, p, t, L, dt, DOMAIN=None, OBSTACLE=None, Vn_BC=None, Vs_BC=None, t_BC_THERMAL=None, PRESSURE_SOLVER=PRESSURE_SOLVER):
     # Prevent numerical issues
     EPSILON = 1e-8
+    SQRT_EPSILON = 1e-12
     MAX_VEL_FORCE = 500.0
     MAX_W_MAG_FOR_L = 100.0
+    MIN_VS_MAG = 1e-4
+    MAX_RELAX_BLEND = 0.95
+    MAX_RELATIVE_DELTA = 50.0
+    MAX_FRICTION_EXP_ARG = 60.0
+    GRAD_SCALE_CHEM = 0.25
+    GRAD_SCALE_VINEN = 0.20
+    GRAD_SCALE_MF = 0.20
+    GRAD_SCALE_DISS = 0.20
 
-    # 1. Get physical properties (Stop gradient on temp to avoid explosive prop derivatives)
-    t_sg = math.stop_gradient(t)
-    VISCOSITY_N, RHO_N, RHO_S, RHO, dRHOdT, ENTROPY, dSdT, alpha_v, beta_v, gamma_v = PropSolver(t_sg)
+    # 1. Get physical properties
+    VISCOSITY_N, RHO_N, RHO_S, RHO, dRHOdT, ENTROPY, dSdT, alpha_v, beta_v, gamma_v = PropSolver(t)
     
     RHO   = field.maximum(RHO, EPSILON)
     RHO_N = field.maximum(RHO_N, EPSILON)
@@ -105,14 +120,14 @@ def SFHelium_step(vn, vs, p, t, L, dt, DOMAIN=None, OBSTACLE=None, Vn_BC=None, V
     # SUB_STEPS = 5
     
     ## for task03
-    # Ly = 0.5
-    # Ny = 200
-    # SUB_STEPS = 20
+    Ly = 0.2
+    Ny = 200
+    SUB_STEPS = 20
     
     ## for task04
-    Ly = 0.320
-    Ny = 320
-    SUB_STEPS = 20
+    # Ly = 0.320
+    # Ny = 320
+    # SUB_STEPS = 20
 
     sponge_top = Ly - Ly/Ny
     steepness = 20000.0
@@ -146,10 +161,12 @@ def SFHelium_step(vn, vs, p, t, L, dt, DOMAIN=None, OBSTACLE=None, Vn_BC=None, V
 
     CHEM_POTENTIAL_n = field.minimum(field.maximum(CHEM_POTENTIAL_n, -MAX_VEL_FORCE), MAX_VEL_FORCE)
     CHEM_POTENTIAL_s = field.minimum(field.maximum(CHEM_POTENTIAL_s, -MAX_VEL_FORCE), MAX_VEL_FORCE)
+    CHEM_POTENTIAL_n = _scale_gradient(CHEM_POTENTIAL_n, GRAD_SCALE_CHEM)
+    CHEM_POTENTIAL_s = _scale_gradient(CHEM_POTENTIAL_s, GRAD_SCALE_CHEM)
 
-    # Cut off gradients through complex thermodynamics to stabilize macroscopic inversion
-    CHEM_POTENTIAL_n = math.stop_gradient(CHEM_POTENTIAL_n)
-    CHEM_POTENTIAL_s = math.stop_gradient(CHEM_POTENTIAL_s)
+    # Keep gradients through the chemical-potential terms so inversion can
+    # respond to trajectory mismatch. More aggressive gradient truncation can
+    # be reintroduced later if this proves numerically unstable.
 
     vn = vn + CHEM_POTENTIAL_n * dt
     vs = vs - CHEM_POTENTIAL_s * dt
@@ -170,19 +187,22 @@ def SFHelium_step(vn, vs, p, t, L, dt, DOMAIN=None, OBSTACLE=None, Vn_BC=None, V
         L_centered  = L.at(t)
         
         vns_vec = vn_centered - vs_centered
-        w_sq = field.vec_squared(vns_vec)
-        w_mag = field.vec_length(vns_vec)
-        vs_mag = field.vec_length(vs_centered)
+        # Use smooth norms to avoid undefined gradients at exactly zero speed.
+        w_mag = math.sqrt(field.vec_squared(vns_vec) + SQRT_EPSILON)
+        vs_mag = math.sqrt(field.vec_squared(vs_centered) + SQRT_EPSILON)
         w_mag_safe = field.maximum(w_mag, EPSILON)
-        vs_mag_safe = field.maximum(vs_mag, EPSILON)
+        # Keep denominator away from zero to avoid exploding local gradients.
+        vs_mag_safe = field.maximum(vs_mag, MIN_VS_MAG)
         
         # --- B. Vinen Equation ---
-        safe_L_sqrt = math.sqrt(field.maximum(L_centered, 0.0))
+        # Smooth sqrt at zero to avoid infinite/NaN backward derivatives.
+        safe_L_sqrt = math.sqrt(field.maximum(L_centered, 0.0) + SQRT_EPSILON)
         
         term1 = -2.4 * KAPPA * safe_L_sqrt
         term2 = -(RHO_N/RHO) * w_mag_safe # 使用 safe mag
         
         vL_scalar = (term1 + term2) / vs_mag_safe
+        vL_scalar = _scale_gradient(vL_scalar, GRAD_SCALE_VINEN)
         
         MAX_V_VAL = 100.0
         vL_scalar = field.minimum(field.maximum(vL_scalar, -MAX_V_VAL), MAX_V_VAL)
@@ -198,10 +218,15 @@ def SFHelium_step(vn, vs, p, t, L, dt, DOMAIN=None, OBSTACLE=None, Vn_BC=None, V
         # Production and decay terms
         w_mag_for_prod = field.minimum(w_mag_safe, MAX_W_MAG_FOR_L)
         
-        term_prod = alpha_v * w_mag_for_prod * (L_centered ** 1.5)
-        term_nucl = gamma_v * (w_mag_for_prod ** 2.5) 
+        # Smooth fractional power near zero to avoid singular backward
+        # derivative from L^(3/2) when L -> 0.
+        safe_L_pow = field.maximum(L_centered, 0.0) + SQRT_EPSILON
+        term_prod = alpha_v * w_mag_for_prod * (safe_L_pow ** 1.5)
+        safe_w_pow = field.maximum(w_mag_for_prod, 0.0) + SQRT_EPSILON
+        term_nucl = gamma_v * (safe_w_pow ** 2.5)
         
         L_source = term_prod + term_nucl
+        L_source = _scale_gradient(L_source, GRAD_SCALE_VINEN)
         denom = 1.0 + dt_sub * beta_v * L_centered
         denom = field.maximum(denom, EPSILON)
         
@@ -216,21 +241,33 @@ def SFHelium_step(vn, vs, p, t, L, dt, DOMAIN=None, OBSTACLE=None, Vn_BC=None, V
         # Calculate the inverse of the decay time constant: 1/tau_decay ~ Friction Frequency
         # F_friction ~ - (B kappa / 3) * L * w
         freq = (B / 3.0 * KAPPA) * L_new_center
+        freq = field.maximum(freq, 0.0)
         
         # Computing Decay Factor: exp(-freq * dt)
         # If freq * dt is large, decay -> 0 (completely locked)
         # If freq * dt is small, decay -> 1 (no friction)
-        change_factor = 1.0 - field.exp(-freq * dt_sub)
+        exp_arg = field.minimum(freq * dt_sub, MAX_FRICTION_EXP_ARG)
+        change_factor = 1.0 - field.exp(-exp_arg)
+        change_factor = field.minimum(field.maximum(change_factor, 0.0), MAX_RELAX_BLEND)
+        change_factor = _scale_gradient(change_factor, GRAD_SCALE_MF)
         
-        # Interpolate to staggered grid, STOP gradient on friction coefficient to prevent Vinen feedback loop
-        alpha_at_vn = math.stop_gradient(change_factor.at(vn))
-        alpha_at_vs = math.stop_gradient(change_factor.at(vs))
+        # Keep gradients through the mutual-friction coefficient so the
+        # inversion can respond to Fns-driven particle mismatch.
+        alpha_at_vn = change_factor.at(vn)
+        alpha_at_vs = change_factor.at(vs)
         
         vs_at_vn = vs.at(t).at(vn)
         vn_at_vs = vn.at(t).at(vs)
+
+        rel_vn = vs_at_vn - vn
+        rel_vs = vn_at_vs - vs
+        rel_vn = field.minimum(field.maximum(rel_vn, -MAX_RELATIVE_DELTA), MAX_RELATIVE_DELTA)
+        rel_vs = field.minimum(field.maximum(rel_vs, -MAX_RELATIVE_DELTA), MAX_RELATIVE_DELTA)
+        rel_vn = _scale_gradient(rel_vn, GRAD_SCALE_MF)
+        rel_vs = _scale_gradient(rel_vs, GRAD_SCALE_MF)
         
-        vn = vn + (rho_ratio_s.at(vn) * alpha_at_vn) * (vs_at_vn - vn)
-        vs = vs + (rho_ratio_n.at(vs) * alpha_at_vs) * (vn_at_vs - vs)
+        vn = vn + (rho_ratio_s.at(vn) * alpha_at_vn) * rel_vn
+        vs = vs + (rho_ratio_n.at(vs) * alpha_at_vs) * rel_vs
 
     
     # 7. Thermodynamic Dissipation
@@ -244,11 +281,13 @@ def SFHelium_step(vn, vs, p, t, L, dt, DOMAIN=None, OBSTACLE=None, Vn_BC=None, V
     Fns_coeff_final = B_coeff_final * (RHO_S/RHO) 
     
     dissipation_energy = Fns_coeff_final * field.vec_squared(vns_final)
+    dissipation_energy = _scale_gradient(dissipation_energy, GRAD_SCALE_DISS)
     
     heat_capacity = t * (ENTROPY * dRHOdT + RHO * dSdT)
     heat_capacity = field.maximum(heat_capacity, 1e-5)
     
     t_dissipa = dissipation_energy / heat_capacity
+    t_dissipa = _scale_gradient(t_dissipa, GRAD_SCALE_DISS)
     t = t + t_dissipa * dt
     t = t - cooling_zone * cooling_rate * (t - COLD_SOURCE_INTENSITY) * dt/2
     
@@ -291,7 +330,7 @@ def constrain_markers_push(markers, sphere_obstacle):
     center = sphere_obstacle.geometry.center
     radius = sphere_obstacle.geometry.radius
     diff = markers - center
-    dist = math.vec_length(diff)
+    dist = math.sqrt(math.vec_squared(diff) + 1e-12)
     epsilon = 1e-4
     correction = center + (diff / (dist + 1e-6)) * (radius + epsilon)
     is_inside = dist < radius

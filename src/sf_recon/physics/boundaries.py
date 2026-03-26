@@ -8,7 +8,8 @@ def get_rbc_bcs(heat_value=10.0, cold_value=-10.0, v_bc_val=0):
 def get_sf_bcs(Vn_IN, Vs_IN, PRESSURE_0=0.0, heat_grad_zero=True):
     # Simple boundary factory: explicit inlet velocities expected as args
 
-    Vn_BC = {'x': 0, 'y-': vec(x=0, y=Vn_IN), 'y+': ZERO_GRADIENT}
+    # Vn_BC = {'x': 0, 'y-': vec(x=0, y=Vn_IN), 'y+': ZERO_GRADIENT}
+    Vn_BC = {'x': extrapolation.PERIODIC, 'y-': vec(x=0, y=Vn_IN), 'y+': ZERO_GRADIENT}
     Vs_BC = {'x': extrapolation.PERIODIC, 'y-': vec(x=0, y=Vs_IN), 'y+': ZERO_GRADIENT}
     J_BC = {'x': 0, 'y-': vec(x=0, y=0), 'y+': ZERO_GRADIENT}
     t_BC_THERMAL = {'x': ZERO_GRADIENT, 'y-': ZERO_GRADIENT, 'y+': ZERO_GRADIENT}

@@ -5,21 +5,17 @@ This script generates a Ground Truth (GT) using the SFHelium model and
 then performs inversion for the normal-fluid initial field `vn`.
 
 Optimization follows the proven D4.py approach:
-  - Direct CenteredGrid field as optimization variable
-  - L-BFGS-B via phiflow minimize()
-  - jax.lax.scan + jax.checkpoint for memory-efficient forward simulation
-  - Marker MSE loss + smoothness + energy regularization
+    - Direct CenteredGrid field as optimization variable
+    - L-BFGS-B via phiflow minimize()
+    - jax.lax.scan + jax.checkpoint for memory-efficient forward simulation
+    - Marker position/velocity loss
 """
 from phi.jax.flow import *
 from phi.jax.flow import Box, StaggeredGrid, CenteredGrid, ZERO_GRADIENT, instance, advect, math, batch, jit_compile, spatial, channel, dual, geom, PointCloud, minimize
 from sf_recon.physics import helium, boundaries
 from sf_recon.utils import io
 from sf_recon.utils.guess import (
-    add_param_noise,
-    build_center_coordinate_features,
     build_counterflow_inflow_prior,
-    build_mlp,
-    build_uniform_inflow_prior,
     native_to_centered_grid,
 )
 from sf_recon.utils.load import load_csv_to_grids_cf
@@ -77,9 +73,6 @@ def main():
     PRE_STEPS = 5
     MSE_WEIGHT = 1e10
     VEL_WEIGHT = 0
-    SMOOTH_WEIGHT = 0   # smoothness weight
-    ENERGY_WEIGHT  = 0   # energy weight
-    ZERO_WEIGHT    = 0  # anti-zero weight (prevent trivial all-zero solution)
     DOMAIN = dict(x=Nx, y=Ny, bounds=Box(x=Lx, y=Ly))
     OBSTACLE = None
 
@@ -248,7 +241,7 @@ def main():
         @jit_compile
         def loss_terms(v_guess_centered):
             """
-            Loss = marker position + marker velocity + smoothness + energy.
+            Loss = marker position + marker velocity.
             v_guess_centered: CenteredGrid (Nx, Ny, vector=2)
             """
             # A. Convert guess to StaggeredGrid for physics
@@ -297,32 +290,14 @@ def main():
             gt_vel_native = gt_target_native - prev_gt_native
             vel_loss = jnp.sum((pred_vel_native - gt_vel_native) ** 2)
 
-            # F. Smoothness regularization (gradient penalty on the guess field)
-            u_component = v_guess_centered.vector['x']
-            v_component = v_guess_centered.vector['y']
-            grad_u = field.spatial_gradient(u_component)
-            grad_v = field.spatial_gradient(v_component)
-            smoothness_loss = field.l2_loss(grad_u) + field.l2_loss(grad_v)
-
-            # G. Energy penalty (limit total kinetic energy)
-            vn_vals = v_guess_centered.values.native(['x', 'y', 'vector'])
-            energy_loss = 0.5 * jnp.sum(vn_vals ** 2)
-
-            # H. Anti-zero penalty (prevent trivial all-zero solution)
-            mean_sq = jnp.mean(vn_vals ** 2)
-            anti_zero_loss = 1.0 / (mean_sq + 1e-12)
-
-            return mse_loss, vel_loss, smoothness_loss, energy_loss, anti_zero_loss
+            return mse_loss, vel_loss
 
         @jit_compile
         def loss_function(v_guess_centered):
-            mse_loss, vel_loss, smoothness_loss, energy_loss, anti_zero_loss = loss_terms(v_guess_centered)
+            mse_loss, vel_loss = loss_terms(v_guess_centered)
             total_loss = (
                 MSE_WEIGHT * mse_loss
                 + VEL_WEIGHT * vel_loss
-                + SMOOTH_WEIGHT * smoothness_loss
-                + ENERGY_WEIGHT * energy_loss
-                + ZERO_WEIGHT * anti_zero_loss
             )
             return total_loss
 
@@ -330,65 +305,13 @@ def main():
         # C. Initialize guess & run L-BFGS-B optimization
         # ------------------------------------------------------------------
         print('\nInitializing optimization guess...')
-        # Build a small coordinate-to-field network for warm-start candidates.
-        coord_features_np = build_center_coordinate_features(Nx, Ny, Lx, Ly)
-        coord_features_native = jnp.asarray(coord_features_np)
-        hidden_layers = [args.nn_width] * args.nn_depth
-        net_init_fun, net_apply_fun = build_mlp(hidden_layers)
-        _, net_params = net_init_fun(jax.random.PRNGKey(0), (-1, 2))
-
-        # Build simple realistic priors from known inflow information only.
-        zero_values = math.zeros(spatial(x=Nx, y=Ny) & channel(vector='x,y'))
-        base_values = v0_gt0.at_centers().values
-        uniform_native = build_uniform_inflow_prior(Nx * Ny, Vn_IN, dtype=jnp.float64)
         prior_native = build_counterflow_inflow_prior(Nx * Ny, Vn_IN, dtype=jnp.float64)
-
-        def network_to_init_values(net_params_local):
-            return jnp.asarray(net_apply_fun(net_params_local, coord_features_native))
-
-        def candidate_native_fields():
-            nn_native = network_to_init_values(net_params)
-            yield 'nn/base', nn_native
-            yield 'uniform/inflow', uniform_native
-            yield 'prior/counterflow', prior_native
-            yield 'mix/nn-uniform', 0.5 * nn_native + 0.5 * uniform_native
-            yield 'mix/nn-prior', 0.5 * nn_native + 0.5 * prior_native
-        
         guess_shape = v0_gt0.at_centers().values.shape
         noise_scale = 0.0005
         noise = math.random_uniform(guess_shape, low=-noise_scale, high=noise_scale)
-
-        best_loss = None
-        best_init_values = None
-        search_key = jax.random.PRNGKey(0)
-
-        for label, candidate_native in candidate_native_fields():
-            candidate_values = native_to_centered_grid(candidate_native, Nx, Ny, DOMAIN['bounds'], Vn_BC).values + noise
-            candidate_grid = CenteredGrid(values=candidate_values, extrapolation=Vn_BC, bounds=DOMAIN['bounds'])
-            candidate_loss = loss_function(candidate_grid)
-            candidate_loss_float = float(candidate_loss)
-            print(f'Warm-start candidate [{label}]: loss={candidate_loss_float:.6e}')
-            if best_loss is None or candidate_loss_float < best_loss:
-                best_loss = candidate_loss_float
-                best_init_values = candidate_values
-
-        total_random_candidates = max(0, args.outer_iters * args.warmstart_candidates)
-        for outer_step in range(total_random_candidates):
-            search_key, candidate_key = jax.random.split(search_key)
-            candidate_params = add_param_noise(net_params, candidate_key, args.warmstart_noise)
-            nn_native = network_to_init_values(candidate_params)
-            mix_ratio = 0.35 + 0.3 * ((outer_step % 3) / 2.0)
-            candidate_native = mix_ratio * nn_native + (1.0 - mix_ratio) * prior_native
-            candidate_values = native_to_centered_grid(candidate_native, Nx, Ny, DOMAIN['bounds'], Vn_BC).values + noise
-            candidate_grid = CenteredGrid(values=candidate_values, extrapolation=Vn_BC, bounds=DOMAIN['bounds'])
-            candidate_loss = loss_function(candidate_grid)
-            candidate_loss_float = float(candidate_loss)
-            print(f'Warm-start candidate [nn+prior {outer_step + 1}/{total_random_candidates}]: loss={candidate_loss_float:.6e}')
-            if best_loss is None or candidate_loss_float < best_loss:
-                best_loss = candidate_loss_float
-                best_init_values = candidate_values
-
-        init_values = best_init_values if best_init_values is not None else (base_values + noise)
+        init_values = native_to_centered_grid(prior_native, Nx, Ny, DOMAIN['bounds'], Vn_BC).values + noise
+        candidate_grid = CenteredGrid(values=init_values, extrapolation=Vn_BC, bounds=DOMAIN['bounds'])
+        print(f'Warm-start prior [counterflow]: loss={float(loss_function(candidate_grid)):.6e}')
         
         v_guess_proxy = CenteredGrid(
             values=init_values,
@@ -404,10 +327,7 @@ def main():
             print(
                 'Initial terms: '
                 f'mse={float(init_terms[0]):.6e}, '
-                f'vel={float(init_terms[1]):.6e}, '
-                f'smooth={float(init_terms[2]):.6e}, '
-                f'energy={float(init_terms[3]):.6e}, '
-                f'zero={float(init_terms[4]):.6e}'
+                f'vel={float(init_terms[1]):.6e}'
             )
         except Exception as e:
             print(f'Initial loss evaluation failed: {e}')
@@ -438,10 +358,7 @@ def main():
         print(
             'Final terms: '
             f'mse={float(final_terms[0]):.6e}, '
-            f'vel={float(final_terms[1]):.6e}, '
-            f'smooth={float(final_terms[2]):.6e}, '
-            f'energy={float(final_terms[3]):.6e}, '
-            f'zero={float(final_terms[4]):.6e}'
+            f'vel={float(final_terms[1]):.6e}'
         )
 
         # Compare with GT
